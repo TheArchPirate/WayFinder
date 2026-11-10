@@ -77,6 +77,11 @@ python3 wayfinder.py --data bh.zip --owned owned.txt
 
 # Machine-readable output
 python3 wayfinder.py --data bh.zip --json report.json
+
+# Full HTML report — non-truncated findings + attack paths as SVG node/edge
+# diagrams; self-contained (inline CSS/SVG, no JS, no external resources), so
+# it renders on an air-gapped machine
+python3 wayfinder.py --data bh.zip --user JSMITH@CORP.LOCAL --html report.html
 ```
 
 ### Options
@@ -92,13 +97,14 @@ python3 wayfinder.py --data bh.zip --json report.json
 | `--limit N` | Max findings printed per section (default 15) |
 | `--full` | No truncation |
 | `--json <file>` | Write full findings as JSON |
+| `--html <file>` | Write a full (non-truncated) HTML report with attack paths rendered as BloodHound-style SVG chain diagrams |
 | `--no-color` | Disable ANSI colors (for piping/files) |
 | `--include-inherited` | Include inherited ACEs (noisy — off by default) |
 
 ### Example output
 
 ```
-[Wayfinder v1.5.4] loaded 7 collection file(s)
+[Wayfinder v1.6.0] loaded 7 collection file(s)
   Objects: 6 users, 2 groups, 4 computers, 1 domains | Edges: 17
   Entra ID: 2 object(s) across 2 file(s) — hybrid analysis enabled
 

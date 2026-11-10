@@ -33,6 +33,7 @@ FALSE-POSITIVE DISCIPLINE (applies to every check):
 """
 import argparse
 import datetime
+import html
 import json
 import re
 import sys
@@ -40,7 +41,8 @@ import zipfile
 from collections import defaultdict, deque
 from pathlib import Path
 
-VERSION = "1.5.4"
+VERSION = "1.6.0"
+TOOL_NAME = "Wayfinder"
 
 # --------------------------------------------------------------------------
 # Well-known principals / noise reduction
@@ -1712,6 +1714,149 @@ def find_anomalies(g):
 
 
 # --------------------------------------------------------------------------
+# HTML report (fully self-contained: inline CSS + inline SVG, no JS, no
+# external resources — the file works air-gapped)
+# --------------------------------------------------------------------------
+_HTML_CSS = """
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{background:#0d1117;color:#c9d1d9;font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+     margin:0;padding:24px;max-width:1200px}
+h1{color:#e6edf3;margin:0 0 4px}
+h2{color:#e6edf3;font-size:17px;margin:0}
+.sub{color:#8b949e;margin-bottom:24px}
+.stats{color:#8b949e;margin-bottom:24px}
+details{background:#161b22;border:1px solid #30363d;border-radius:8px;margin:0 0 12px}
+summary{cursor:pointer;padding:12px 16px;list-style:none}
+summary::-webkit-details-marker{display:none}
+summary h2{display:inline}
+.count{color:#8b949e;font-weight:normal;font-size:13px;margin-left:8px}
+.body{padding:0 16px 14px}
+.finding{border-top:1px solid #21262d;padding:9px 4px}
+.finding:first-child{border-top:none}
+.fname{font-weight:600;color:#e6edf3;word-break:break-all}
+.fdetail{color:#9da7b1;font-size:13px;margin-top:2px;word-break:break-word}
+.hist{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:#8b949e;margin-top:4px}
+.sev{display:inline-block;font:700 11px ui-monospace,SFMono-Regular,Menlo,monospace;
+     padding:1px 7px;border-radius:10px;margin-right:8px;vertical-align:1px}
+.sev-CRIT{background:#da3633;color:#fff}
+.sev-HIGH{background:#9e2a2b;color:#ffd9d7}
+.sev-MED{background:#8a5a00;color:#ffe3a3}
+.sev-INFO{background:#21262d;color:#8b949e}
+.path{margin:14px 0 22px;overflow-x:auto}
+.ptitle{color:#e6edf3;font-weight:600;margin-bottom:6px}
+.pop{display:inline-block;font:700 10px ui-monospace,Menlo,monospace;background:#8a5a00;color:#ffe3a3;
+     padding:1px 7px;border-radius:10px;margin-left:8px;vertical-align:1px}
+svg text{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+rect.node{fill:#161b22;stroke:#3d444d;stroke-width:1.2}
+rect.start{stroke:#3fb950;stroke-width:2}
+rect.target{stroke:#f85149;stroke-width:2}
+text.ntext{fill:#e6edf3;font-size:11.5px}
+text.etext{fill:#8ab4f8;font-size:10.5px}
+line.edge{stroke:#8ab4f8;stroke-width:1.4}
+footer{color:#484f58;font-size:12px;margin-top:28px}
+"""
+
+
+def _esc(s):
+    return html.escape(str(s), quote=True)
+
+
+def _svg_path(chain, idx):
+    """Render one attack path as a horizontal SVG node->edge->node chain
+    (BloodHound-style path view, stdlib-generated inline SVG)."""
+    nodes = [chain[0][0]] + [d for _, _, d in chain]
+    kinds = [k for _, k, _ in chain]
+
+    def nw(label):
+        return max(80, int(len(label) * 6.6) + 22)
+
+    def ew(label):
+        return max(96, int(len(label) * 6.0) + 40)
+
+    x, pos = 10, []
+    for i, nname in enumerate(nodes):
+        w = nw(nname)
+        pos.append((x, w))
+        x += w + (ew(kinds[i]) if i < len(kinds) else 0)
+    total, cy, H = x + 10, 48, 78
+    o = [f'<svg width="{total}" height="{H}" viewBox="0 0 {total} {H}" '
+         f'xmlns="http://www.w3.org/2000/svg" role="img">',
+         f'<defs><marker id="arr{idx}" viewBox="0 0 10 10" refX="9" refY="5" '
+         f'markerWidth="7" markerHeight="7" orient="auto-start-reverse">'
+         f'<path d="M 0 0 L 10 5 L 0 10 z" fill="#8ab4f8"/></marker></defs>']
+    for i, (nx, w) in enumerate(pos):
+        cls = "start" if i == 0 else ("target" if i == len(pos) - 1 else "")
+        o.append(f'<rect class="node {cls}" x="{nx}" y="{cy-16}" width="{w}" height="32" rx="7"/>')
+        o.append(f'<text class="ntext" x="{nx + w / 2:.0f}" y="{cy + 4}" text-anchor="middle">{_esc(nodes[i])}</text>')
+        if i < len(kinds):
+            ex0, ex1 = nx + w, nx + w + ew(kinds[i])
+            o.append(f'<line class="edge" x1="{ex0 + 3}" y1="{cy}" x2="{ex1 - 7}" y2="{cy}" marker-end="url(#arr{idx})"/>')
+            o.append(f'<text class="etext" x="{(ex0 + ex1) / 2:.0f}" y="{cy - 11}" text-anchor="middle">{_esc(kinds[i])}</text>')
+    o.append("</svg>")
+    return "".join(o)
+
+
+def render_html(stats, sections, paths, wins):
+    """Build the full (non-truncated) self-contained HTML report."""
+    gen = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    o = ["<!DOCTYPE html><html><head><meta charset='utf-8'>",
+         "<meta name='viewport' content='width=device-width,initial-scale=1'>",
+         f"<title>{_esc(TOOL_NAME)} report — {_esc(gen)}</title>",
+         f"<style>{_HTML_CSS}</style></head><body>",
+         "<h1>{_esc(TOOL_NAME)} report</h1>",
+         f"<div class='sub'>Generated {_esc(gen)} &middot; {_esc(TOOL_NAME)} v{_esc(VERSION)} &middot; "
+         "fully offline &mdash; this file loads no external resources</div>",
+         f"<div class='stats'>{stats['users']} users &middot; {stats['groups']} groups &middot; "
+         f"{stats['computers']} computers &middot; {stats['domains']} domains &middot; "
+         f"{stats['edges']} edges" + (f" &middot; {stats['azure']} Entra ID objects" if stats.get("azure") else "") + "</div>"]
+
+    # quick wins
+    o.append("<details open><summary><h2>Quick Wins"
+             f"<span class='count'>{len(wins)} CRIT/HIGH finding(s)</span></h2></summary><div class='body'>")
+    if not wins:
+        o.append("<div class='finding'><span class='fname'>No CRIT/HIGH quick wins identified.</span></div>")
+    for i, (title, f) in enumerate(wins, 1):
+        o.append(f"<div class='finding'><span class='sev sev-{_esc(f['sev'])}'>{_esc(f['sev'])}</span>"
+                 f"<span class='fname'>{i}. {_esc(f['name'])}</span>"
+                 f"<div class='fdetail'>{_esc(title)}</div></div>")
+    o.append("</div></details>")
+
+    # attack paths as SVG chains
+    if paths:
+        o.append(f"<details open><summary><h2>Attack Paths"
+                 f"<span class='count'>{len(paths)}</span></h2></summary><div class='body'>")
+        for i, p in enumerate(paths, 1):
+            pop = "<span class='pop'>DEFAULT POPULATION — any domain account</span>" if p.get("from") else ""
+            o.append(f"<div class='path'><div class='ptitle'>Path #{i} — {p['depth']} hop(s) to "
+                     f"{_esc(p['target'])}{pop}</div>")
+            o.append(_svg_path(p["chain"], i))
+            o.append("</div>")
+        o.append("</div></details>")
+
+    # findings sections (non-truncated)
+    for title, findings in sections.items():
+        if not findings:
+            continue
+        o.append(f"<details open><summary><h2>{_esc(title)}"
+                 f"<span class='count'>{len(findings)}</span></h2></summary><div class='body'>")
+        for f in sorted(findings, key=lambda x: SEV_ORDER.get(x["sev"], 9)):
+            o.append(f"<div class='finding'><span class='sev sev-{_esc(f['sev'])}'>{_esc(f['sev'])}</span>"
+                     f"<span class='fname'>{_esc(f['name'])}</span>")
+            if f.get("detail") and f["detail"] != f["name"]:
+                o.append(f"<div class='fdetail'>{_esc(f['detail'])}</div>")
+            if f.get("os_histogram"):
+                rows = " &middot; ".join(f"{_esc(k)}: {v}" for k, v in f["os_histogram"].items())
+                o.append(f"<div class='hist'>{rows}</div>")
+            o.append("</div>")
+        o.append("</div></details>")
+
+    o.append(f"<footer>{_esc(TOOL_NAME)} v{_esc(VERSION)} &middot; offline BloodHound collection analyzer</footer>")
+    o.append("</body></html>")
+    return "\n".join(o)
+
+
+# --------------------------------------------------------------------------
 # Pathfinding (BFS shortest paths to high-value targets)
 # --------------------------------------------------------------------------
 def bfs_paths(g, start_sids, max_depth=8, max_paths=5):
@@ -1816,6 +1961,9 @@ def main():
                     help="Max findings printed per section (default 15)")
     ap.add_argument("--full", action="store_true", help="No truncation of findings")
     ap.add_argument("--json", type=Path, help="Write full findings as JSON to this file")
+    ap.add_argument("--html", type=Path,
+                    help="Write a full (non-truncated) self-contained HTML report "
+                         "(inline SVG attack-path graphs; works air-gapped)")
     ap.add_argument("--no-color", action="store_true")
     ap.add_argument("--include-inherited", action="store_true",
                     help="Include inherited ACEs in analysis (noisy)")
@@ -1856,7 +2004,7 @@ def main():
     n_domains = sum(1 for n in g.nodes.values() if n["kind"] == "DOMAIN")
 
     n_ad = len(docs) - skipped - len(az_docs)
-    print(f"{C.BOLD}[Wayfinder v{VERSION}]{C.RESET} loaded {n_ad} collection file(s)")
+    print(f"{C.BOLD}[{TOOL_NAME} v{VERSION}]{C.RESET} loaded {n_ad} collection file(s)")
     print(f"  Objects: {n_users} users, {n_groups} groups, {n_comps} computers, "
           f"{n_domains} domains | Edges: {len(g.edges)}")
     if az_docs:
@@ -1996,6 +2144,18 @@ def main():
             print(f"[!] could not write JSON report: {e}", file=sys.stderr)
         else:
             print(f"\n[+] JSON findings written to {args.json}")
+
+    # ---- optional HTML report ----
+    if args.html:
+        n_az = sum(len(doc_objects(d)) for _, d in az_docs)
+        stats = {"users": n_users, "groups": n_groups, "computers": n_comps,
+                 "domains": n_domains, "edges": len(g.edges), "azure": n_az}
+        try:
+            args.html.write_text(render_html(stats, sections, paths, wins))
+        except OSError as e:
+            print(f"[!] could not write HTML report: {e}", file=sys.stderr)
+        else:
+            print(f"\n[+] HTML report written to {args.html}")
 
 
 if __name__ == "__main__":
