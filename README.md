@@ -145,4 +145,4 @@ python3 wayfinder.py --data bh.zip --user JSMITH@CORP.LOCAL --html report.html
 
 ## License
 
-Choose a license before publishing (MIT is a common choice for tools like this).
+MIT — see [LICENSE](LICENSE).
