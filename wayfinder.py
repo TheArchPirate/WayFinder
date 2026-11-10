@@ -41,7 +41,7 @@ import zipfile
 from collections import defaultdict, deque
 from pathlib import Path
 
-VERSION = "1.6.1"
+VERSION = "1.8.0"
 TOOL_NAME = "Wayfinder"
 
 # --------------------------------------------------------------------------
@@ -58,7 +58,21 @@ NOISE_SIDS = {
     "S-1-5-10",        # SELF (validated-write self ACEs)
     "S-1-3-0",         # CREATOR OWNER
 }
-NOISE_RID_SUFFIXES = ("-512", "-519", "-518")  # DA / EA / Schema Admins
+NOISE_RID_SUFFIXES = ("-512", "-519", "-518", "-500", "-516", "-498")
+# DA / EA / Schema Admins / built-in Administrator / Domain Controllers / Enterprise RODCs
+# (the last three hold replication rights by design; the rest are tier-0 by definition)
+
+# Base names (before @DOMAIN) of built-in principals whose control rights are expected
+NOISE_NAMES = {
+    "ENTERPRISE DOMAIN CONTROLLERS", "CREATOR OWNER", "SELF",
+    "ADMINISTRATORS", "ADMINISTRATOR", "DOMAIN CONTROLLERS",
+    "ENTERPRISE READ-ONLY DOMAIN CONTROLLERS", "DOMAIN ADMINS",
+    "ENTERPRISE ADMINS", "SCHEMA ADMINS",
+}
+
+# v4 collections domain-prefix BUILTIN SIDs ("MEGACORP.LOCAL-S-1-5-32-544");
+# extract the trailing SID for well-known comparisons
+_TRAILING_SID_RE = re.compile(r"S-1-\d[\d-]*$")
 
 TIER0_RIDS = {
     "-512": "Domain Admins",
@@ -163,6 +177,19 @@ DESC_HINT = re.compile(
 )
 
 SEV_ORDER = {"CRIT": 0, "HIGH": 1, "MED": 2, "INFO": 3}
+
+# Severity model (calibrated against PingCastle health-check scoring and
+# SpecterOps Certified Pre-Owned guidance):
+#   CRIT — direct path to domain/forest/tenant compromise or tier-0 credential
+#          theft from a low-priv position (DCSync rights, ESC1/6/7-ManageCA,
+#          unconstrained delegation, stealth tier-0 membership)
+#   HIGH — one condition away (needs relay/coercion/one more right), or
+#          privileged-account credential exposure (AS-REP, roastable admin,
+#          RBCD, LAPS/gMSA readers, privileged sessions, SID-filtering off)
+#   MED  — enabler or situational: needs another misconfiguration or a
+#          post-compromise position (MAQ>0, Guest enabled, SMB signing off,
+#          stale-but-roastable standard users, moderate group membership)
+#   INFO — expected/default configuration, hygiene, inventory
 
 
 # --------------------------------------------------------------------------
@@ -424,15 +451,22 @@ class Graph:
         return n["name"] if n else (sid or "?")
 
     def is_noise_principal(self, sid):
-        if sid in NOISE_SIDS:
+        if not isinstance(sid, str) or not sid:
+            return False
+        s = sid.strip()
+        if not s.startswith("S-"):
+            m = _TRAILING_SID_RE.search(s)
+            if m:
+                s = m.group(0)
+        if s in NOISE_SIDS:
             return True
-        if sid.endswith(NOISE_RID_SUFFIXES):
+        if s.endswith(NOISE_RID_SUFFIXES):
             return True
-        n = self.nodes.get(sid)
+        n = self.nodes.get(sid) or self.nodes.get(s)
         if n:
             # v5/v6 names carry the @DOMAIN suffix — compare the base name
             base = n["name"].upper().split("@", 1)[0]
-            if base in ("ENTERPRISE DOMAIN CONTROLLERS", "CREATOR OWNER", "SELF"):
+            if base in NOISE_NAMES:
                 return True
         return False
 
@@ -459,8 +493,23 @@ class Graph:
             for ace in _as_list(obj.get("Aces")):
                 if not isinstance(ace, dict):
                     continue
-                psid = _as_str(ace.get("PrincipalSID")).upper()
+                # an explicit Deny ACE grants nothing — treating it as a control
+                # edge would be a false positive (missing/empty AceType = Allow
+                # in every SharpHound schema, so only exclude explicit denies)
+                acetype = _as_str(ace.get("AceType"))
+                if "denied" in acetype.lower():
+                    continue
+                psid = _as_str(ace.get("PrincipalSID")).strip().upper()
                 right = _as_str(ace.get("RightName"))
+                # v4 schema: extended rights carry the actual right in AceType
+                # (GetChanges/GetChangesAll/...), and ownership is RightName
+                # "Owner" (v5+: "Owns")
+                if right == "ExtendedRight":
+                    right = {"GetChanges": "GetChanges", "GetChangesAll": "GetChangesAll",
+                             "GetChangesInFilteredSet": "GetChangesInFilteredSet",
+                             "All": "AllExtendedRights"}.get(acetype, "")
+                elif right == "Owner":
+                    right = "Owns"
                 if not right:
                     continue
                 inh = bool(ace.get("IsInherited"))
@@ -470,7 +519,8 @@ class Graph:
             for m in _as_list(obj.get("Members")):
                 if not isinstance(m, dict):
                     continue
-                msid = _as_str(m.get("ObjectIdentifier")).upper()
+                # v4 schema uses MemberId/MemberType instead of ObjectIdentifier/ObjectType
+                msid = _as_str(m.get("ObjectIdentifier") or m.get("MemberId")).strip().upper()
                 self.add_edge(msid, sid, "MemberOf")
                 self.groups_members[sid].append(msid)
 
@@ -706,17 +756,23 @@ def find_dcsync(g):
     rights_by_principal = defaultdict(set)   # (src, domain) -> {rights}
     grant_paths = defaultdict(set)           # (src, domain) -> {rights}
     dc_expected = set()                      # DC machine accounts — replication is by design
+    default_holders = set()                  # default/built-in principals (DA, BUILTIN Admins, Enterprise DCs)
     for src, dst, kind, inh in g.edges:
-        if inh or g.is_noise_principal(src):
+        if inh:
             continue
         n = g.nodes.get(dst)
         if not n or n["kind"] != "DOMAIN":
             continue
         if kind not in DCSYNC_RIGHTS | {"WriteDacl", "GenericAll", "AllExtendedRights", "WriteOwner"}:
             continue
-        # individual DCs holding replication rights is expected, not a finding
         srcn = g.nodes.get(src, {})
         sp = srcn.get("props", {})
+        # built-in principals holding these rights is expected — surface as INFO
+        # (not omitted) so the operator can still find the object when searching
+        if g.is_noise_principal(src):
+            default_holders.add(g.name(src))
+            continue
+        # individual DCs holding replication rights is expected, not a finding
         if srcn.get("kind") == "COMPUTER" and kind in DCSYNC_RIGHTS and (
                 sp.get("isdc") or "OU=DOMAIN CONTROLLERS" in _as_str(sp.get("distinguishedname")).upper()):
             dc_expected.add(srcn.get("name", src))
@@ -729,23 +785,40 @@ def find_dcsync(g):
     if dc_expected:
         out.append({"sev": "INFO",
                     "name": f"{len(dc_expected)} DC(s) hold replication rights (expected by design)",
-                    "detail": ", ".join(sorted(dc_expected)[:10])})
+                    "detail": ", ".join(sorted(dc_expected))})
+    if default_holders:
+        out.append({"sev": "INFO",
+                    "name": f"{len(default_holders)} built-in/default principal(s) hold replication rights (expected)",
+                    "detail": ", ".join(sorted(default_holders))})
     for (src, dst), kinds in rights_by_principal.items():
         out.append({"sev": "CRIT", "name": g.name(src),
-                    "detail": f"{' + '.join(sorted(kinds))} on domain {g.name(dst)} — DCSync possible"})
+                    "detail": f"{' + '.join(sorted(kinds))} on domain {g.name(dst)} — DCSync possible",
+                    "src": src, "dst": dst})
     for (src, dst), kinds in grant_paths.items():
         out.append({"sev": "CRIT", "name": g.name(src),
-                    "detail": f"{' + '.join(sorted(kinds))} on domain {g.name(dst)} — can grant self DCSync rights (e.g. Exchange Windows Permissions pattern)"})
+                    "detail": f"{' + '.join(sorted(kinds))} on domain {g.name(dst)} — can grant self DCSync rights (e.g. Exchange Windows Permissions pattern)",
+                    "src": src, "dst": dst})
     return out
 
 
 def find_dangerous_acls(g):
     out = []
+    hv_suffixes = tuple(TIER0_RIDS) + ("-544",)
     for src, dst, kind, inh in g.edges:
         if kind in DANGEROUS_RIGHTS and not inh:
             if g.is_noise_principal(src) or src == dst:
                 continue
-            out.append({"sev": DANGEROUS_RIGHTS[kind],
+            sev = DANGEROUS_RIGHTS[kind]
+            # GenericAll is only CRIT when the target is itself high-value;
+            # GenericAll on an arbitrary low-value object is a one-step
+            # escalation primitive, not domain compromise
+            if kind == "GenericAll" and sev == "CRIT":
+                tgt = g.nodes.get(dst, {})
+                if not (tgt.get("props", {}).get("highvalue")
+                        or tgt.get("kind") == "DOMAIN"
+                        or dst.endswith(hv_suffixes)):
+                    sev = "HIGH"
+            out.append({"sev": sev,
                         "name": f"{g.name(src)} --{kind}--> {g.name(dst)}",
                         "detail": f"{g.name(src)} has {kind} over {g.name(dst)}",
                         "src": src, "dst": dst, "right": kind})
@@ -1053,9 +1126,9 @@ def find_domain_policy(g):
         maq = p.get("machineaccountquota")
         if maq is not None and str(maq).lstrip("-").isdigit():
             if int(maq) > 0:
-                out.append({"sev": "HIGH",
+                out.append({"sev": "MED",
                             "name": f"{n['name']}: MachineAccountQuota={maq}",
-                            "detail": "Any domain user can create machine accounts — RBCD/noPac-style attacks and relay-to-LDAP computer creation are possible"})
+                            "detail": "Any domain user can create machine accounts — enabler for RBCD/noPac-style attacks and relay-to-LDAP computer creation (needs another primitive to exploit)"})
         lock = p.get("lockoutthreshold")
         if lock is not None or p.get("minpwdlength") is not None:
             lock = p.get("lockoutthreshold")
@@ -1409,9 +1482,20 @@ def find_foreign_edges(g):
     """Non-inherited control edges where principal and target live in different domains."""
     interesting = set(DANGEROUS_RIGHTS) | DCSYNC_RIGHTS | {"AdminTo", "MemberOf"}
     out = []
+
+    def _norm(sid):
+        # v4 collections domain-prefix BUILTIN SIDs ("DOM.LOCAL-S-1-5-32-544") —
+        # normalize to the trailing SID before domain comparison
+        if not sid.startswith("S-"):
+            m = _TRAILING_SID_RE.search(sid)
+            if m:
+                return m.group(0)
+        return sid
+
     for src, dst, kind, inh in g.edges:
         if inh or kind not in interesting or src == dst:
             continue
+        src, dst = _norm(src), _norm(dst)
         if "-" not in src or "-" not in dst:
             continue
         # same domain if either SID is a prefix of the other (domain-root SIDs
@@ -1421,6 +1505,8 @@ def find_foreign_edges(g):
             continue
         if src.startswith("S-1-5-32") or src in LOW_PRIV_SIDS or src == "S-1-5-18":
             continue
+        if g.is_noise_principal(src):
+            continue  # tier-0/built-in principals holding control is default DACL, not a finding
         if kind == "MemberOf":
             tgt = g.nodes.get(dst, {})
             if not tgt.get("props", {}).get("highvalue"):
@@ -1672,8 +1758,8 @@ def find_stealth(g):
     # Enabled Guest
     for sid, n in g.nodes.items():
         if n["kind"] == "USER" and sid.endswith("-501") and n["props"].get("enabled"):
-            out.append({"sev": "HIGH", "name": n["name"],
-                        "detail": "Built-in Guest account is ENABLED — anonymous/null-session access likely possible"})
+            out.append({"sev": "MED", "name": n["name"],
+                        "detail": "Built-in Guest account is ENABLED — anonymous/null-session access may be possible (largely mitigated by default since Server 2003; verify what it can actually reach)"})
     # SID history
     for sid, n in g.nodes.items():
         hist = _as_list(n["props"].get("sidhistory"))
@@ -1733,7 +1819,7 @@ def find_anomalies(g):
 
 
 # --------------------------------------------------------------------------
-# HTML report (fully self-contained: inline CSS + inline SVG, no JS, no
+# HTML report (fully self-contained: inline CSS + inline SVG + inline JS, no
 # external resources — the file works air-gapped)
 # --------------------------------------------------------------------------
 _HTML_CSS = """
@@ -1744,7 +1830,26 @@ body{background:#0d1117;color:#c9d1d9;font:14px/1.5 -apple-system,Segoe UI,Robot
 h1{color:#e6edf3;margin:0 0 4px}
 h2{color:#e6edf3;font-size:17px;margin:0}
 .sub{color:#8b949e;margin-bottom:24px}
-.stats{color:#8b949e;margin-bottom:24px}
+.stats{color:#8b949e;margin-bottom:16px}
+.toolbar{position:sticky;top:8px;z-index:10;background:#1c2129;border:1px solid #3d444d;border-radius:8px;
+         padding:12px 14px;margin-bottom:14px;box-shadow:0 3px 10px rgba(0,0,0,.45)}
+.searchbar{display:flex;align-items:center}
+.searchbar input{flex:1;max-width:560px;background:#0d1117;border:1px solid #30363d;border-radius:6px;
+                 color:#e6edf3;padding:8px 12px;font-size:14px}
+.searchbar input:focus{outline:none;border-color:#1f6feb}
+#qcount{color:#8b949e;font-size:12px;margin-left:10px;white-space:nowrap}
+.chips{display:flex;gap:8px;margin-top:10px;align-items:center}
+.chipslbl{color:#8b949e;font-size:11px;text-transform:uppercase;letter-spacing:.06em;margin-right:2px}
+.chip{font:700 11px ui-monospace,SFMono-Regular,Menlo,monospace;padding:2px 12px;border-radius:10px;
+      border:1px solid #30363d;background:transparent;color:#8b949e;cursor:pointer;opacity:.4}
+.chip.on{opacity:1}
+.chip.c-CRIT.on{background:#da3633;border-color:#da3633;color:#fff}
+.chip.c-HIGH.on{background:#9e2a2b;border-color:#9e2a2b;color:#ffd9d7}
+.chip.c-MED.on{background:#8a5a00;border-color:#8a5a00;color:#ffe3a3}
+.chip.c-INFO.on{background:#21262d;border-color:#8b949e;color:#c9d1d9}
+.finding.hit,.path.hit{box-shadow:inset 3px 0 0 #1f6feb}
+.hide{display:none}
+details.noresult{opacity:.4}
 details{background:#161b22;border:1px solid #30363d;border-radius:8px;margin:0 0 12px}
 summary{cursor:pointer;padding:12px 16px;list-style:none}
 summary::-webkit-details-marker{display:none}
@@ -1823,12 +1928,22 @@ def render_html(stats, sections, paths, wins):
          "<meta name='viewport' content='width=device-width,initial-scale=1'>",
          f"<title>{_esc(TOOL_NAME)} report — {_esc(gen)}</title>",
          f"<style>{_HTML_CSS}</style></head><body>",
-         "<h1>{_esc(TOOL_NAME)} report</h1>",
+         f"<h1>{_esc(TOOL_NAME)} report</h1>",
          f"<div class='sub'>Generated {_esc(gen)} &middot; {_esc(TOOL_NAME)} v{_esc(VERSION)} &middot; "
          "fully offline &mdash; this file loads no external resources</div>",
          f"<div class='stats'>{stats['users']} users &middot; {stats['groups']} groups &middot; "
          f"{stats['computers']} computers &middot; {stats['domains']} domains &middot; "
-         f"{stats['edges']} edges" + (f" &middot; {stats['azure']} Entra ID objects" if stats.get("azure") else "") + "</div>"]
+         f"{stats['edges']} edges" + (f" &middot; {stats['azure']} Entra ID objects" if stats.get("azure") else "") + "</div>",
+         "<div class='toolbar'>"
+         "<div class='searchbar'><input id='q' type='search' autocomplete='off' "
+         "placeholder='Search objects, findings and attack paths (name, SID, edge kind, section)&hellip;'>"
+         "<span id='qcount'></span></div>"
+         "<div class='chips'><span class='chipslbl'>Severity</span>"
+         "<button class='chip c-CRIT on' data-sev='CRIT'>CRIT</button>"
+         "<button class='chip c-HIGH on' data-sev='HIGH'>HIGH</button>"
+         "<button class='chip c-MED on' data-sev='MED'>MED</button>"
+         "<button class='chip c-INFO on' data-sev='INFO'>INFO</button>"
+         "</div></div>"]
 
     # quick wins
     o.append("<details open><summary><h2>Quick Wins"
@@ -1871,6 +1986,34 @@ def render_html(stats, sections, paths, wins):
         o.append("</div></details>")
 
     o.append(f"<footer>{_esc(TOOL_NAME)} v{_esc(VERSION)} &middot; offline BloodHound collection analyzer</footer>")
+    o.append("<script>(function(){"
+             "var q=document.getElementById('q'),cnt=document.getElementById('qcount');"
+             "if(!q)return;"
+             "var chips=Array.prototype.slice.call(document.querySelectorAll('.chip'));"
+             "var secs=Array.prototype.slice.call(document.querySelectorAll('details'));"
+             "function filt(){"
+             "var s=q.value.trim().toLowerCase(),total=0;"
+             "var filtering=!!s||chips.some(function(c){return !c.classList.contains('on');});"
+             "secs.forEach(function(d){"
+             "var sum=d.querySelector('summary');"
+             "var secHit=!!s&&sum&&sum.textContent.toLowerCase().indexOf(s)!==-1;"
+             "var items=d.querySelectorAll('.finding,.path'),vis=0;"
+             "items.forEach(function(it){"
+             "var sv=it.querySelector('.sev');"
+             "var sevOk=!sv||!sv.className.match(/sev-(CRIT|HIGH|MED|INFO)/)||"
+             "document.querySelector('.chip.c-'+sv.textContent.trim()).classList.contains('on');"
+             "var txtOk=!s||secHit||it.textContent.toLowerCase().indexOf(s)!==-1;"
+             "var ok=sevOk&&txtOk;"
+             "it.classList.toggle('hide',!ok);"
+             "it.classList.toggle('hit',ok&&!!s);"
+             "if(ok)vis++;});"
+             "if(filtering){d.open=vis>0;d.classList.toggle('noresult',vis===0);}"
+             "else{d.open=true;d.classList.remove('noresult');}"
+             "total+=vis;});"
+             "cnt.textContent=filtering?total+' match(es)':'';}"
+             "q.addEventListener('input',filt);"
+             "chips.forEach(function(c){c.addEventListener('click',function(){"
+             "c.classList.toggle('on');filt();});});})();</script>")
     o.append("</body></html>")
     return "\n".join(o)
 

@@ -19,7 +19,7 @@ BloodHound collections are some of the most sensitive artifacts on an engagement
 
 **Delegation & replication**
 - Unconstrained, constrained, and protocol-transition (S4U2Self) delegation, RBCD edges
-- DCSync rights (`GetChanges`, `GetChangesAll`, filtered) plus grant paths (`WriteDacl`/`GenericAll` on the domain object)
+- DCSync rights (`GetChanges`, `GetChangesAll`, filtered) plus grant paths (`WriteDacl`/`GenericAll` on the domain object) — default holders (Domain Admins, BUILTIN\Administrators, DCs, Enterprise DCs/RODCs, built-in Administrator) are reported as INFO, not CRIT
 
 **ADCS (Certified Pre-Owned)**
 - ESC1–ESC11, ESC13, ESC15, ESC16 detection from collected CA/template/registry data
@@ -47,6 +47,8 @@ BloodHound collections are some of the most sensitive artifacts on an engagement
 
 **Precision-first (no false positives by design)**
 - Only explicitly collected values are flagged — an absent key never implies a misconfiguration
+- Severity ratings calibrated against industry references (PingCastle health-check scoring, SpecterOps Certified Pre-Owned): CRIT = direct path to domain/tenant compromise, HIGH = one condition away, MED = enabler/situational, INFO = expected/hygiene
+- Deny ACEs never produce control edges; deny ACEs and inherited noise are excluded at ingest
 - Only well-known, vendor-published GUIDs/SIDs/RIDs are matched by identity; unknown custom roles are ignored, never guessed
 - Composite attack chains require *all* conditions present; partial matches are reported at lower severity with "verify" notes
 - Registry-derived findings require the registry collection to have succeeded
@@ -79,8 +81,9 @@ python3 wayfinder.py --data bh.zip --owned owned.txt
 python3 wayfinder.py --data bh.zip --json report.json
 
 # Full HTML report — non-truncated findings + attack paths as SVG node/edge
-# diagrams; self-contained (inline CSS/SVG, no JS, no external resources), so
-# it renders on an air-gapped machine
+# diagrams, with a live search bar (filter by object name, SID, edge kind, or
+# section) and severity filter chips (CRIT/HIGH/MED/INFO); self-contained
+# (inline CSS/SVG/JS, no external resources), so it renders on an air-gapped machine
 python3 wayfinder.py --data bh.zip --user JSMITH@CORP.LOCAL --html report.html
 ```
 
@@ -97,14 +100,14 @@ python3 wayfinder.py --data bh.zip --user JSMITH@CORP.LOCAL --html report.html
 | `--limit N` | Max findings printed per section (default 15) |
 | `--full` | No truncation |
 | `--json <file>` | Write full findings as JSON |
-| `--html <file>` | Write a full (non-truncated) HTML report with attack paths rendered as BloodHound-style SVG chain diagrams |
+| `--html <file>` | Write a full (non-truncated) HTML report with attack paths rendered as BloodHound-style SVG chain diagrams, a live search bar (object name, SID, edge kind, section), and severity filter chips (CRIT/HIGH/MED/INFO) |
 | `--no-color` | Disable ANSI colors (for piping/files) |
 | `--include-inherited` | Include inherited ACEs (noisy — off by default) |
 
 ### Example output
 
 ```
-[Wayfinder v1.6.1] loaded 7 collection file(s)
+[Wayfinder v1.8.0] loaded 7 collection file(s)
   Objects: 6 users, 2 groups, 4 computers, 1 domains | Edges: 17
   Entra ID: 2 object(s) across 2 file(s) — hybrid analysis enabled
 
@@ -134,7 +137,7 @@ python3 wayfinder.py --data bh.zip --user JSMITH@CORP.LOCAL --html report.html
 ## Input formats
 
 - **SharpHound v5/v6** (current collectors) — fully supported: users, groups, computers, domains, GPOs, OUs, containers, and the ADCS object types (cert templates, enterprise/root/AIA CAs, NTAuthStore, issuance policies)
-- **SharpHound v4** — best-effort property normalization
+- **SharpHound v4** — fully normalized: `ExtendedRight` ACEs resolved via AceType (`GetChanges`/`GetChangesAll`/…), `Owner` → `Owns` edges, `MemberId` membership, domain-prefixed BUILTIN SIDs (`DOMAIN.LOCAL-S-1-5-32-544`) recognized for expected-principal filtering
 - **AzureHound v2** — users, groups, service principals, role assignments/definitions, ARM role assignments, app role assignments, key vaults
 
 ## Known limitations (by honesty, not by accident)
