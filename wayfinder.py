@@ -41,7 +41,7 @@ import zipfile
 from collections import defaultdict, deque
 from pathlib import Path
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 TOOL_NAME = "Wayfinder"
 
 # --------------------------------------------------------------------------
@@ -929,6 +929,12 @@ def find_laps(g):
     for src, dst, kind, inh in g.edges:
         if inh or g.is_noise_principal(src):
             continue
+        # DCs implicitly read everything — a DC holding a read edge is expected
+        srcn = g.nodes.get(src, {})
+        sp = srcn.get("props", {})
+        if srcn.get("kind") == "COMPUTER" and (
+                sp.get("isdc") or "OU=DOMAIN CONTROLLERS" in _as_str(sp.get("distinguishedname")).upper()):
+            continue
         if kind in LAPS_RIGHTS:
             out.append({"sev": "HIGH",
                         "name": f"{g.name(src)} --{kind}--> {g.name(dst)}",
@@ -1005,6 +1011,20 @@ def find_password_hygiene(g):
 def find_descriptions(g):
     out = []
     for sid, n in g.nodes.items():
+        # built-in objects (BUILTIN SIDs, well-known RIDs < 1000) ship with
+        # Microsoft-authored default descriptions — flagging those is pure FP
+        s = sid
+        if not s.startswith("S-"):
+            m = _TRAILING_SID_RE.search(s)
+            if m:
+                s = m.group(0)
+        if s.startswith("S-1-5-32"):
+            continue
+        try:
+            if 0 < int(s.rsplit("-", 1)[1]) < 1000:
+                continue
+        except (IndexError, ValueError):
+            pass
         desc = n["props"].get("description")
         if isinstance(desc, str) and desc and DESC_HINT.search(desc):
             out.append({"sev": "MED", "name": n["name"],
@@ -1455,12 +1475,15 @@ def find_moderate_groups(g):
                 label, note = n["name"], MODERATE_GROUP_NAMES[short]
         if label is None:
             continue
+        # the Denied-RODC group is protective (members' creds are never cached
+        # on RODCs) — populated is good hygiene, not an attack surface
+        sev = "INFO" if sid.endswith("-572") else "MED"
         members = [g.name(m) for m in g.groups_members.get(sid, [])]
         # skip default/noise members for the builtin ops groups
         members = [m for m in members if m.upper() not in
                    ("ENTERPRISE ADMINS", "DOMAIN ADMINS") and not m.upper().startswith("EXCHANGE ")]
         if members:
-            out.append({"sev": "MED", "name": f"{label} ({len(members)} members)",
+            out.append({"sev": sev, "name": f"{n['name']} ({len(members)} members)",
                         "detail": f"{note}: {', '.join(sorted(members)[:12])}"})
     # Protected Users coverage: tier-0 members missing from RID 525
     for sid, n in g.nodes.items():
@@ -1826,7 +1849,21 @@ _HTML_CSS = """
 :root{color-scheme:dark}
 *{box-sizing:border-box}
 body{background:#0d1117;color:#c9d1d9;font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
-     margin:0;padding:24px;max-width:1200px}
+     margin:0;padding:24px;max-width:1500px}
+.wrap{display:flex;gap:20px;align-items:flex-start}
+.main{flex:1;min-width:0}
+.side{flex:0 0 300px;position:sticky;top:110px;max-height:calc(100vh - 130px);overflow-y:auto}
+.sideh{color:#e6edf3;font-size:15px;margin:0 0 8px}
+.side details{margin-bottom:8px}
+.side summary{padding:8px 12px}
+.side summary h3{display:inline;font-size:13px;color:#e6edf3;margin:0}
+.invs{padding:0 12px 10px}
+.invs details.subdet{background:none;border:none;border-radius:0;margin:0}
+.invs details.subdet summary{padding:2px 0}
+.invh{color:#8b949e;font-size:11px;text-transform:uppercase;letter-spacing:.06em;display:inline-block;margin:6px 0 2px}
+.inv{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:#c9d1d9;padding:1px 0;word-break:break-all}
+.inv.hv{color:#ffb4ae}
+@media(max-width:1100px){.wrap{flex-direction:column}.side{position:static;flex:none;width:100%;max-height:none}}
 h1{color:#e6edf3;margin:0 0 4px}
 h2{color:#e6edf3;font-size:17px;margin:0}
 .sub{color:#8b949e;margin-bottom:24px}
@@ -1847,7 +1884,7 @@ h2{color:#e6edf3;font-size:17px;margin:0}
 .chip.c-HIGH.on{background:#9e2a2b;border-color:#9e2a2b;color:#ffd9d7}
 .chip.c-MED.on{background:#8a5a00;border-color:#8a5a00;color:#ffe3a3}
 .chip.c-INFO.on{background:#21262d;border-color:#8b949e;color:#c9d1d9}
-.finding.hit,.path.hit{box-shadow:inset 3px 0 0 #1f6feb}
+.finding.hit,.path.hit,.inv.hit{box-shadow:inset 3px 0 0 #1f6feb}
 .hide{display:none}
 details.noresult{opacity:.4}
 details{background:#161b22;border:1px solid #30363d;border-radius:8px;margin:0 0 12px}
@@ -1921,7 +1958,48 @@ def _svg_path(chain, idx):
     return "".join(o)
 
 
-def render_html(stats, sections, paths, wins):
+def build_inventory(g):
+    """Domain object inventory for the HTML sidebar, split high-value/standard."""
+    inv = {}
+
+    def add(header, name, high):
+        e = inv.setdefault(header, {"high": [], "std": []})
+        e["high" if high else "std"].append(name)
+
+    tier0 = g.tier0_member_sids()
+    hv_group_suffixes = tuple(TIER0_RIDS) + ("-544",)
+    for sid, n in g.nodes.items():
+        k, p, name = n["kind"], n["props"], n["name"]
+        hv = bool(p.get("highvalue"))
+        if k == "USER":
+            add("Users", name, hv or bool(p.get("admincount")) or sid in tier0)
+        elif k == "GROUP":
+            add("Groups", name, hv or sid.endswith(hv_group_suffixes))
+        elif k == "COMPUTER":
+            isdc = bool(p.get("isdc")) or "OU=DOMAIN CONTROLLERS" in \
+                _as_str(p.get("distinguishedname")).upper()
+            add("Computers", name, hv or isdc)
+        elif k == "DOMAIN":
+            add("Domains", name, True)
+        elif k == "GPO":
+            add("GPOs", name, False)
+        elif k == "OU":
+            add("OUs", name, False)
+        elif k == "CONTAINER":
+            add("Containers", name, False)
+        elif k == "CERTTEMPLATE":
+            add("Certificate Templates", name, hv)
+        elif k in ("ENTERPRISECA", "ROOTCA", "AIACA"):
+            add("Certification Authorities", name, True)
+        elif k in ("NTAUTHSTORE", "ISSUANCEPOLICY"):
+            add("PKI Objects", name, True)
+    for e in inv.values():
+        e["high"].sort()
+        e["std"].sort()
+    return inv
+
+
+def render_html(stats, sections, paths, wins, inventory=None):
     """Build the full (non-truncated) self-contained HTML report."""
     gen = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     o = ["<!DOCTYPE html><html><head><meta charset='utf-8'>",
@@ -1943,7 +2021,8 @@ def render_html(stats, sections, paths, wins):
          "<button class='chip c-HIGH on' data-sev='HIGH'>HIGH</button>"
          "<button class='chip c-MED on' data-sev='MED'>MED</button>"
          "<button class='chip c-INFO on' data-sev='INFO'>INFO</button>"
-         "</div></div>"]
+         "</div></div>",
+         "<div class='wrap'><div class='main'>"]
 
     # quick wins
     o.append("<details open><summary><h2>Quick Wins"
@@ -1985,31 +2064,58 @@ def render_html(stats, sections, paths, wins):
             o.append("</div>")
         o.append("</div></details>")
 
+    o.append("</div>")  # close .main
+
+    # domain inventory sidebar
+    if inventory:
+        o.append("<aside class='side'><h2 class='sideh'>Domain Inventory</h2>")
+        for header, e in inventory.items():
+            total = len(e["high"]) + len(e["std"])
+            if not total:
+                continue
+            o.append(f"<details open><summary><h3>{_esc(header)}"
+                     f"<span class='count'>{total}</span></h3></summary><div class='invs'>")
+            if e["high"]:
+                o.append(f"<details open class='subdet'><summary><span class='invh'>High value ({len(e['high'])})</span></summary>")
+                for nm in e["high"]:
+                    o.append(f"<div class='inv hv'>{_esc(nm)}</div>")
+                o.append("</details>")
+            if e["std"]:
+                o.append(f"<details open class='subdet'><summary><span class='invh'>Standard ({len(e['std'])})</span></summary>")
+                for nm in e["std"]:
+                    o.append(f"<div class='inv'>{_esc(nm)}</div>")
+                o.append("</details>")
+            o.append("</div></details>")
+        o.append("</aside>")
+
+    o.append("</div>")  # close .wrap
     o.append(f"<footer>{_esc(TOOL_NAME)} v{_esc(VERSION)} &middot; offline BloodHound collection analyzer</footer>")
     o.append("<script>(function(){"
              "var q=document.getElementById('q'),cnt=document.getElementById('qcount');"
              "if(!q)return;"
              "var chips=Array.prototype.slice.call(document.querySelectorAll('.chip'));"
              "var secs=Array.prototype.slice.call(document.querySelectorAll('details'));"
+             "var items=Array.prototype.slice.call(document.querySelectorAll('.finding,.path,.inv'));"
              "function filt(){"
              "var s=q.value.trim().toLowerCase(),total=0;"
              "var filtering=!!s||chips.some(function(c){return !c.classList.contains('on');});"
-             "secs.forEach(function(d){"
-             "var sum=d.querySelector('summary');"
-             "var secHit=!!s&&sum&&sum.textContent.toLowerCase().indexOf(s)!==-1;"
-             "var items=d.querySelectorAll('.finding,.path'),vis=0;"
              "items.forEach(function(it){"
+             "var secHit=false;"
+             "if(s){var d=it.closest('details');"
+             "while(d){var sum=d.querySelector('summary');"
+             "if(sum&&sum.textContent.toLowerCase().indexOf(s)!==-1){secHit=true;break;}"
+             "d=d.parentElement?d.parentElement.closest('details'):null;}}"
              "var sv=it.querySelector('.sev');"
              "var sevOk=!sv||!sv.className.match(/sev-(CRIT|HIGH|MED|INFO)/)||"
              "document.querySelector('.chip.c-'+sv.textContent.trim()).classList.contains('on');"
-             "var txtOk=!s||secHit||it.textContent.toLowerCase().indexOf(s)!==-1;"
-             "var ok=sevOk&&txtOk;"
+             "var ok=sevOk&&(!s||secHit||it.textContent.toLowerCase().indexOf(s)!==-1);"
              "it.classList.toggle('hide',!ok);"
              "it.classList.toggle('hit',ok&&!!s);"
-             "if(ok)vis++;});"
+             "if(ok)total++;});"
+             "secs.forEach(function(d){"
+             "var vis=d.querySelectorAll('.finding:not(.hide),.path:not(.hide),.inv:not(.hide)').length;"
              "if(filtering){d.open=vis>0;d.classList.toggle('noresult',vis===0);}"
-             "else{d.open=true;d.classList.remove('noresult');}"
-             "total+=vis;});"
+             "else{d.open=true;d.classList.remove('noresult');}});"
              "cnt.textContent=filtering?total+' match(es)':'';}"
              "q.addEventListener('input',filt);"
              "chips.forEach(function(c){c.addEventListener('click',function(){"
@@ -2313,7 +2419,7 @@ def main():
         stats = {"users": n_users, "groups": n_groups, "computers": n_comps,
                  "domains": n_domains, "edges": len(g.edges), "azure": n_az}
         try:
-            args.html.write_text(render_html(stats, sections, paths, wins))
+            args.html.write_text(render_html(stats, sections, paths, wins, build_inventory(g)))
         except OSError as e:
             print(f"[!] could not write HTML report: {e}", file=sys.stderr)
         else:

@@ -100,14 +100,14 @@ python3 wayfinder.py --data bh.zip --user JSMITH@CORP.LOCAL --html report.html
 | `--limit N` | Max findings printed per section (default 15) |
 | `--full` | No truncation |
 | `--json <file>` | Write full findings as JSON |
-| `--html <file>` | Write a full (non-truncated) HTML report with attack paths rendered as BloodHound-style SVG chain diagrams, a live search bar (object name, SID, edge kind, section), and severity filter chips (CRIT/HIGH/MED/INFO) |
+| `--html <file>` | Write a full (non-truncated) HTML report with attack paths rendered as BloodHound-style SVG chain diagrams, a live search bar (object name, SID, edge kind, section), severity filter chips (CRIT/HIGH/MED/INFO), and a domain-inventory sidebar (users/groups/computers/PKI, high-value split from standard) |
 | `--no-color` | Disable ANSI colors (for piping/files) |
 | `--include-inherited` | Include inherited ACEs (noisy — off by default) |
 
 ### Example output
 
 ```
-[Wayfinder v1.8.0] loaded 7 collection file(s)
+[Wayfinder v1.9.0] loaded 7 collection file(s)
   Objects: 6 users, 2 groups, 4 computers, 1 domains | Edges: 17
   Entra ID: 2 object(s) across 2 file(s) — hybrid analysis enabled
 
