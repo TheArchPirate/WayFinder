@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Wayfinder — fully offline BloodHound/SharpHound collection analyzer.
+wayfinder.py — fully offline BloodHound/SharpHound collection analyzer.
 
 Parses a SharpHound zip export (or a directory of the JSONs inside it) and
 surfaces everything useful for an offensive engagement: roasting targets,
@@ -41,7 +41,7 @@ import zipfile
 from collections import defaultdict, deque
 from pathlib import Path
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 TOOL_NAME = "Wayfinder"
 
 # --------------------------------------------------------------------------
@@ -54,6 +54,9 @@ NOISE_SIDS = {
     "S-1-5-32-549",    # Server Operators
     "S-1-5-32-550",    # Print Operators
     "S-1-5-32-551",    # Backup Operators
+    "S-1-5-9",         # Enterprise Domain Controllers (default replication rights)
+    "S-1-5-10",        # SELF (validated-write self ACEs)
+    "S-1-3-0",         # CREATOR OWNER
 }
 NOISE_RID_SUFFIXES = ("-512", "-519", "-518")  # DA / EA / Schema Admins
 
@@ -426,9 +429,11 @@ class Graph:
         if sid.endswith(NOISE_RID_SUFFIXES):
             return True
         n = self.nodes.get(sid)
-        if n and n["name"].upper() in (
-                "ENTERPRISE DOMAIN CONTROLLERS", "CREATOR OWNER", "SELF"):
-            return True
+        if n:
+            # v5/v6 names carry the @DOMAIN suffix — compare the base name
+            base = n["name"].upper().split("@", 1)[0]
+            if base in ("ENTERPRISE DOMAIN CONTROLLERS", "CREATOR OWNER", "SELF"):
+                return True
         return False
 
     # ----- relationship extraction --------------------------------------
@@ -700,17 +705,31 @@ def find_delegation(g):
 def find_dcsync(g):
     rights_by_principal = defaultdict(set)   # (src, domain) -> {rights}
     grant_paths = defaultdict(set)           # (src, domain) -> {rights}
+    dc_expected = set()                      # DC machine accounts — replication is by design
     for src, dst, kind, inh in g.edges:
         if inh or g.is_noise_principal(src):
             continue
         n = g.nodes.get(dst)
         if not n or n["kind"] != "DOMAIN":
             continue
+        if kind not in DCSYNC_RIGHTS | {"WriteDacl", "GenericAll", "AllExtendedRights", "WriteOwner"}:
+            continue
+        # individual DCs holding replication rights is expected, not a finding
+        srcn = g.nodes.get(src, {})
+        sp = srcn.get("props", {})
+        if srcn.get("kind") == "COMPUTER" and kind in DCSYNC_RIGHTS and (
+                sp.get("isdc") or "OU=DOMAIN CONTROLLERS" in _as_str(sp.get("distinguishedname")).upper()):
+            dc_expected.add(srcn.get("name", src))
+            continue
         if kind in DCSYNC_RIGHTS:
             rights_by_principal[(src, dst)].add(kind)
-        elif kind in ("WriteDacl", "GenericAll", "AllExtendedRights", "WriteOwner"):
+        else:
             grant_paths[(src, dst)].add(kind)
     out = []
+    if dc_expected:
+        out.append({"sev": "INFO",
+                    "name": f"{len(dc_expected)} DC(s) hold replication rights (expected by design)",
+                    "detail": ", ".join(sorted(dc_expected)[:10])})
     for (src, dst), kinds in rights_by_principal.items():
         out.append({"sev": "CRIT", "name": g.name(src),
                     "detail": f"{' + '.join(sorted(kinds))} on domain {g.name(dst)} — DCSync possible"})

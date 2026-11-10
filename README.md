@@ -104,7 +104,7 @@ python3 wayfinder.py --data bh.zip --user JSMITH@CORP.LOCAL --html report.html
 ### Example output
 
 ```
-[Wayfinder v1.6.0] loaded 7 collection file(s)
+[Wayfinder v1.6.1] loaded 7 collection file(s)
   Objects: 6 users, 2 groups, 4 computers, 1 domains | Edges: 17
   Entra ID: 2 object(s) across 2 file(s) — hybrid analysis enabled
 
