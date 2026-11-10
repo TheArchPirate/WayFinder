@@ -21,7 +21,7 @@ BloodHound collections are some of the most sensitive artifacts on an engagement
 
 **Delegation & replication**
 - Unconstrained, constrained, and protocol-transition (S4U2Self) delegation, RBCD edges
-- DCSync rights (`GetChanges`, `GetChangesAll`, filtered) plus grant paths (`WriteDacl`/`GenericAll` on the domain object) — default holders (Domain Admins, BUILTIN\Administrators, DCs, Enterprise DCs/RODCs, built-in Administrator) are reported as INFO, not CRIT
+- DCSync rights (`GetChanges` + `GetChangesAll` required together for CRIT — a single right is reported as a partial "verify" finding), filtered rights, plus grant paths (`WriteDacl`/`GenericAll` on the domain object) — default holders (Domain Admins, BUILTIN\Administrators, DCs, Enterprise DCs/RODCs, built-in Administrator) are reported as INFO, not CRIT
 
 **ADCS (Certified Pre-Owned)**
 - ESC1–ESC11, ESC13, ESC15, ESC16 detection from collected CA/template/registry data
@@ -36,11 +36,11 @@ BloodHound collections are some of the most sensitive artifacts on an engagement
 - Stale and pre-created computer accounts (default machine passwords), password policy + age histogram, credential hints in description fields, `MachineAccountQuota`
 
 **Attack surface & paths**
-- Dangerous non-inherited ACLs (SID-resolved, noise-filtered), cross-domain control edges, GPO control with link-target resolution
+- Dangerous ACLs (SID-resolved, noise-filtered) — direct and inherited container/OU delegation (aggregated per principal+right), cross-domain control edges, GPO control with link-target resolution
 - NTLM relay surface: WebClient hosts, SMB signing off, NTLMv1 (`LmCompatibilityLevel`)
 - Privileged-user sessions, non-standard local admins, LAPS coverage gaps and LAPS/gMSA password readers
 - Trusts with SID-filtering assessment, outdated OS inventory
-- **BFS shortest attack paths** from any principal you specify to any high-value target, plus default-population analysis (what *any* domain account can reach), ending in a numbered quick-wins list
+- **BFS shortest attack paths** from any principal you specify to any high-value target, plus default-population analysis (what *any* domain account can reach), ending in a numbered quick-wins list. Paths traverse nested group membership, sessions (AdminTo → HasSession → privileged user), and inherited container delegation; targets include the built-in tier-0 surface (DA/EA/Schema Admins, BUILTIN\Administrators, domain objects, DCs, Enterprise/Root CAs, NTAuthStore, AdminSDHolder) so analysis never depends on collector-emitted `highvalue` tags
 
 **Hybrid / Entra ID (AzureHound)**
 - Synced privileged identities cross-referenced on-prem ↔ cloud
@@ -106,12 +106,12 @@ python3 wayfinder.py --data bh.zip --user JSMITH@CORP.LOCAL --html report.html
 | `--json <file>` | Write full findings as JSON |
 | `--html <file>` | Write a full (non-truncated) HTML report with attack paths rendered as BloodHound-style SVG chain diagrams, clickable severity summary tiles, a live search bar (object name, SID, edge kind, section), severity filter chips (CRIT/HIGH/MED/INFO), per-finding abuse guidance (Windows/Linux/OPSEC), and a domain-inventory sidebar (users/groups/computers/PKI, high-value split from standard) |
 | `--no-color` | Disable ANSI colors (for piping/files) |
-| `--include-inherited` | Include inherited ACEs (noisy — off by default) |
+| `--include-inherited` | Include ALL inherited ACEs (noisy — off by default; inherited ACEs carrying dangerous rights are always analyzed) |
 
 ### Example output
 
 ```
-[Wayfinder v1.12.0] loaded 7 collection file(s)
+[Wayfinder v1.13.0] loaded 7 collection file(s)
   Objects: 6 users, 2 groups, 4 computers, 1 domains | Edges: 17
   Entra ID: 2 object(s) across 2 file(s) — hybrid analysis enabled
 

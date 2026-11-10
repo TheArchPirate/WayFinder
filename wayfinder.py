@@ -41,7 +41,7 @@ import zipfile
 from collections import defaultdict, deque
 from pathlib import Path
 
-VERSION = "1.12.0"
+VERSION = "1.13.0"
 TOOL_NAME = "Wayfinder"
 
 # --------------------------------------------------------------------------
@@ -99,7 +99,7 @@ GMSA_RIGHTS = {"ReadGMSAPassword", "DumpSMSAPassword"}
 # Edges the pathfinder is willing to traverse (abuse confers control)
 TRAVERSABLE = {
     "MemberOf", "AdminTo", "CanRDP", "CanPSRemote", "ExecuteDCOM", "SQLAdmin",
-    "AllowedToDelegate", "AllowedToAct", "HasSIDHistory",
+    "AllowedToDelegate", "AllowedToAct", "HasSIDHistory", "HasSession",
     *DANGEROUS_RIGHTS.keys(), *DCSYNC_RIGHTS, *LAPS_RIGHTS, *GMSA_RIGHTS,
 }
 
@@ -389,27 +389,71 @@ class Graph:
         return idx.get(src, ())
 
     def traversable_adj(self):
-        """Adjacency map (src -> [(dst, kind)]) over non-inherited TRAVERSABLE
-        edges, built once and cached for the pathfinder."""
+        """Adjacency map (src -> [(dst, kind)]) over TRAVERSABLE edges, built
+        once and cached for the pathfinder. Inherited edges are included only
+        for dangerous rights (container-level delegation materializes as
+        inherited ACEs on child objects — they confer real control)."""
         adj = getattr(self, "_trav_adj", None)
         if adj is None:
             adj = defaultdict(list)
             for src, dst, kind, inh in self.edges:
-                if kind in TRAVERSABLE and not inh:
+                if kind in TRAVERSABLE and (not inh or kind in DANGEROUS_RIGHTS):
                     adj[src].append((dst, kind))
             self._trav_adj = adj
         return adj
 
+    def group_closure(self, roots):
+        """Transitive member closure of the given group SIDs (cycle-safe BFS)."""
+        seen = set(roots)
+        out = set()
+        dq = deque(roots)
+        while dq:
+            grp = dq.popleft()
+            for m in self.groups_members.get(grp, ()):
+                if m in seen:
+                    continue
+                seen.add(m)
+                out.add(m)
+                if m in self.groups_members:
+                    dq.append(m)
+        return out
+
+    def default_pop_groups(self):
+        """Groups that transitively contain a default-population group
+        (Domain Users / Domain Computers / Everyone / Authenticated Users) —
+        e.g. a custom 'All Staff' group nesting Domain Users."""
+        cached = getattr(self, "_defpop_cache", None)
+        if cached is None:
+            rev = defaultdict(list)
+            for grp, mems in self.groups_members.items():
+                for m in mems:
+                    rev[m].append(grp)
+            seeds = [s for s in rev
+                     if s in LOW_PRIV_SIDS or s.endswith(LOW_PRIV_SUFFIXES)]
+            out = set()
+            seen = set(seeds)
+            dq = deque(seeds)
+            while dq:
+                cur = dq.popleft()
+                for parent in rev.get(cur, ()):
+                    if parent not in seen:
+                        seen.add(parent)
+                        out.add(parent)
+                        dq.append(parent)
+            cached = out
+            self._defpop_cache = cached
+        return cached
+
     def tier0_member_sids(self):
-        """Union of members of DA/EA/Schema Admins + BUILTIN Administrators
-        (computed once, cached)."""
+        """Union of (transitively resolved) members of DA/EA/Schema Admins +
+        BUILTIN Administrators (computed once, cached)."""
         cached = getattr(self, "_tier0_members_cache", None)
         if cached is None:
-            cached = set()
-            for sid, n in self.nodes.items():
-                if n["kind"] == "GROUP" and \
-                        (sid.endswith(("-512", "-519", "-518")) or sid == "S-1-5-32-544"):
-                    cached.update(self.groups_members.get(sid, []))
+            roots = [sid for sid, n in self.nodes.items()
+                     if n["kind"] == "GROUP" and
+                     (sid.endswith(("-512", "-519", "-518")) or
+                      sid == "S-1-5-32-544" or sid.endswith("-S-1-5-32-544"))]
+            cached = self.group_closure(roots)
             self._tier0_members_cache = cached
         return cached
 
@@ -420,7 +464,8 @@ class Graph:
             members[:] = list(dict.fromkeys(members))
         for users in self.computer_sessions.values():
             users[:] = list(dict.fromkeys(users))
-        for attr in ("_edges_by_dst", "_edges_by_src", "_trav_adj", "_tier0_members_cache"):
+        for attr in ("_edges_by_dst", "_edges_by_src", "_trav_adj", "_tier0_members_cache",
+                     "_defpop_cache"):
             if hasattr(self, attr):
                 delattr(self, attr)
 
@@ -549,7 +594,9 @@ class Graph:
                         continue
                     usid = _as_str(r.get("UserSID") or r.get("ObjectIdentifier")).upper()
                     if usid:
-                        self.add_edge(usid, sid, "HasSession")
+                        # BloodHound direction: computer -> user, so BFS can walk
+                        # AdminTo host -> HasSession -> privileged user
+                        self.add_edge(sid, usid, "HasSession")
                         self.computer_sessions[sid].append(usid)
 
             la = _as_dict(obj.get("LocalAdmins"))
@@ -697,17 +744,24 @@ def find_kerberoastable(g):
                     pass
             if p.get("admincount") and not p.get("sensitive"):
                 detail += "; privileged and delegatable"
+            raw_enc = p.get("supportedencryptiontypes")
             try:
-                enc = int(p.get("supportedencryptiontypes") or 0)
+                enc = int(raw_enc) if raw_enc is not None else None
             except (TypeError, ValueError):
                 enc = 0
-            if enc and not (enc & 0x18):  # no AES128/AES256
-                algos = []
-                if enc & 0x4: algos.append("RC4")
-                if enc & 0x3: algos.append("DES")
-                sev_note = f"; {'/'.join(algos)}-only Kerberos — tickets crack fast (RC4 keystream is NTLM-derived)"
-                detail += sev_note
-            out.append({"sev": "HIGH" if (p.get("admincount") or (enc and not enc & 0x18)) else "MED",
+            # enc == 0 (collected but unset): the KDC defaults to RC4 for the
+            # session key — as crack-fast as RC4-only. enc is None: the value
+            # was not collected — no inference either way.
+            rc4_fast = enc is not None and (enc == 0 or not (enc & 0x18))
+            if rc4_fast:
+                if enc and enc & 0x3:
+                    algos = "/".join(a for a, b in (("DES", enc & 0x3), ("RC4", enc & 0x4)) if b)
+                    detail += f"; {algos}-only Kerberos — tickets crack fast (RC4 keystream is NTLM-derived)"
+                elif enc:
+                    detail += "; RC4-only Kerberos — tickets crack fast (RC4 keystream is NTLM-derived)"
+                else:
+                    detail += "; msDS-SupportedEncryptionTypes unset — KDC defaults to RC4, tickets crack fast (NTLM-derived keystream)"
+            out.append({"sev": "HIGH" if (p.get("admincount") or rc4_fast) else "MED",
                         "name": n["name"], "admincount": bool(p.get("admincount")),
                         "spns": p.get("serviceprincipalnames") or [],
                         "desc": p.get("description") or "",
@@ -730,7 +784,7 @@ def find_delegation(g):
     for sid, n in g.nodes.items():
         p = n["props"]
         dn = _as_str(p.get("distinguishedname")).upper()
-        is_dc = "OU=DOMAIN CONTROLLERS" in dn
+        is_dc = bool(p.get("isdc")) or "OU=DOMAIN CONTROLLERS" in dn
         if p.get("unconstraineddelegation") and n["kind"] != "DOMAIN":
             if n["kind"] == "COMPUTER" and is_dc:
                 continue  # DCs are unconstrained by design
@@ -791,9 +845,18 @@ def find_dcsync(g):
                     "name": f"{len(default_holders)} built-in/default principal(s) hold replication rights (expected)",
                     "detail": ", ".join(sorted(default_holders))})
     for (src, dst), kinds in rights_by_principal.items():
-        out.append({"sev": "CRIT", "name": g.name(src),
-                    "detail": f"{' + '.join(sorted(kinds))} on domain {g.name(dst)} — DCSync possible",
-                    "src": src, "dst": dst})
+        # DCSync requires GetChanges + GetChangesAll TOGETHER — a single right
+        # is a partial primitive, not an exploitable sync (mimikatz/secretsdump
+        # fail with only one). Matches the "composite chains require all
+        # conditions" principle.
+        if {"GetChanges", "GetChangesAll"} <= kinds:
+            out.append({"sev": "CRIT", "name": g.name(src),
+                        "detail": f"{' + '.join(sorted(kinds))} on domain {g.name(dst)} — DCSync possible",
+                        "src": src, "dst": dst})
+        else:
+            out.append({"sev": "HIGH", "name": g.name(src),
+                        "detail": f"{' + '.join(sorted(kinds))} on domain {g.name(dst)} — partial replication rights only; DCSync needs GetChanges + GetChangesAll together — verify",
+                        "src": src, "dst": dst})
     for (src, dst), kinds in grant_paths.items():
         out.append({"sev": "CRIT", "name": g.name(src),
                     "detail": f"{' + '.join(sorted(kinds))} on domain {g.name(dst)} — can grant self DCSync rights (e.g. Exchange Windows Permissions pattern)",
@@ -804,24 +867,43 @@ def find_dcsync(g):
 def find_dangerous_acls(g):
     out = []
     hv_suffixes = tuple(TIER0_RIDS) + ("-544",)
+
+    def is_hv_target(dst):
+        tgt = g.nodes.get(dst, {})
+        return (tgt.get("props", {}).get("highvalue")
+                or tgt.get("kind") == "DOMAIN"
+                or dst.endswith(hv_suffixes))
+
+    inh_groups = defaultdict(list)   # (src, kind) -> [dst] — container delegation
     for src, dst, kind, inh in g.edges:
-        if kind in DANGEROUS_RIGHTS and not inh:
+        if kind in DANGEROUS_RIGHTS:
             if g.is_noise_principal(src) or src == dst:
+                continue
+            if inh:
+                inh_groups[(src, kind)].append(dst)
                 continue
             sev = DANGEROUS_RIGHTS[kind]
             # GenericAll is only CRIT when the target is itself high-value;
             # GenericAll on an arbitrary low-value object is a one-step
             # escalation primitive, not domain compromise
-            if kind == "GenericAll" and sev == "CRIT":
-                tgt = g.nodes.get(dst, {})
-                if not (tgt.get("props", {}).get("highvalue")
-                        or tgt.get("kind") == "DOMAIN"
-                        or dst.endswith(hv_suffixes)):
-                    sev = "HIGH"
+            if kind == "GenericAll" and sev == "CRIT" and not is_hv_target(dst):
+                sev = "HIGH"
             out.append({"sev": sev,
                         "name": f"{g.name(src)} --{kind}--> {g.name(dst)}",
                         "detail": f"{g.name(src)} has {kind} over {g.name(dst)}",
                         "src": src, "dst": dst, "right": kind})
+    # Inherited rights: delegation granted on an OU/container, materialized on
+    # every child object. Aggregated per principal+right to stay readable.
+    for (src, kind), dsts in sorted(inh_groups.items()):
+        sev = DANGEROUS_RIGHTS[kind]
+        if kind == "GenericAll" and sev == "CRIT" and not any(is_hv_target(d) for d in dsts):
+            sev = "HIGH"
+        names = sorted(g.name(d) for d in dsts)
+        sample = ", ".join(names[:8]) + (f" … +{len(names) - 8} more" if len(names) > 8 else "")
+        out.append({"sev": sev,
+                    "name": f"{g.name(src)} --{kind}--> {len(dsts)} object(s) via container delegation",
+                    "detail": f"{g.name(src)} holds {kind} over {len(dsts)} object(s), inherited from an OU/container grant (delegation misconfig): {sample}",
+                    "src": src, "right": kind})
     return out
 
 
@@ -1062,7 +1144,11 @@ def find_admincount_drift(g):
 def find_trusts(g):
     out = []
     for t in g.trusts:
-        dv = t["direction"] if isinstance(t["direction"], int) else None
+        dv = t["direction"]
+        if not isinstance(dv, int) or isinstance(dv, bool):
+            # some collectors emit names ("Bidirectional") or numeric strings
+            dv = {"disabled": 0, "inbound": 1, "outbound": 2,
+                  "bidirectional": 3}.get(str(dv).strip().lower())
         direction = {0: "Disabled", 1: "Inbound", 2: "Outbound", 3: "Bidirectional"}.get(dv, str(t["direction"]))
         sev = "INFO"
         detail = f"{t['domain']} -> {t['target']}: {direction}, {t['type']}, transitive={t['transitive']}"
@@ -1116,6 +1202,10 @@ def _is_low_priv(g, sid):
         return True
     n = g.nodes.get(sid)
     if n and n["name"].upper() in LOW_PRIV_NAMES:
+        return True
+    # custom group that (transitively) nests a default-population group —
+    # e.g. "All Staff" containing Domain Users is effectively Everyone
+    if sid in g.default_pop_groups():
         return True
     return False
 
@@ -1405,6 +1495,7 @@ def find_weak_crypto(g):
     if not_sensitive:
         unconstrained = [n["name"] for n in g.nodes.values()
                          if n["kind"] == "COMPUTER" and n["props"].get("unconstraineddelegation")
+                         and not n["props"].get("isdc")
                          and "OU=DOMAIN CONTROLLERS" not in _as_str(n["props"].get("distinguishedname")).upper()]
         if unconstrained:
             for name in not_sensitive:
@@ -2572,9 +2663,24 @@ def bfs_paths(g, start_sids, max_depth=8, max_paths=5):
     start sid to any high-value node."""
     adj = g.traversable_adj()
 
-    targets = {sid for sid, n in g.nodes.items()
-               if n["props"].get("highvalue") or
-               (n["kind"] == "GROUP" and sid.endswith(("-512", "-519", "-518")))}
+    # Tier-zero targets. Don't rely solely on collector-emitted "highvalue"
+    # (absent in some schemas) — enumerate the built-in tier-0 surface too.
+    targets = set()
+    for sid, n in g.nodes.items():
+        p, k = n["props"], n["kind"]
+        if p.get("highvalue"):
+            targets.add(sid)
+        elif k == "GROUP" and (sid.endswith(("-512", "-519", "-518"))
+                               or sid.endswith("S-1-5-32-544")):
+            targets.add(sid)
+        elif k in ("DOMAIN", "ENTERPRISECA", "ROOTCA", "NTAUTHSTORE"):
+            targets.add(sid)
+        elif k == "COMPUTER" and (p.get("isdc") or "OU=DOMAIN CONTROLLERS" in
+                                  _as_str(p.get("distinguishedname")).upper()):
+            targets.add(sid)
+        elif k == "CONTAINER" and "ADMINDSHOLDER" in \
+                _as_str(p.get("distinguishedname")).upper():
+            targets.add(sid)
     targets -= set(start_sids)
     if not targets:
         return []
@@ -2703,7 +2809,14 @@ def main():
         g.ingest(name, doc)
 
     if not args.include_inherited:
-        g.edges = [e for e in g.edges if not e[3] or e[2] == "MemberOf"]
+        # Inherited ACEs are dropped — except those carrying dangerous rights:
+        # OU/container-level delegation (e.g. Helpdesk -> GenericAll on an OU)
+        # materializes as inherited ACEs on every child object, and dropping
+        # them blinds the tool to the most common real-world delegation
+        # misconfig. --include-inherited still keeps everything.
+        _KEEP_INH = (set(DANGEROUS_RIGHTS) | DCSYNC_RIGHTS | LAPS_RIGHTS |
+                     GMSA_RIGHTS | {"MemberOf"})
+        g.edges = [e for e in g.edges if not e[3] or e[2] in _KEEP_INH]
     g.finalize()
 
     n_users = sum(1 for n in g.nodes.values() if n["kind"] == "USER")
@@ -2731,7 +2844,7 @@ def main():
     sections["Moderately-Privileged Groups"] = find_moderate_groups(g)
     sections["Stealth & Hidden Memberships"] = find_stealth(g)
     sections["Anomalies (orphan SIDs, new tier-0 objects)"] = find_anomalies(g)
-    sections["Dangerous ACLs (non-inherited, noise-filtered)"] = find_dangerous_acls(g)
+    sections["Dangerous ACLs (noise-filtered, incl. container delegation)"] = find_dangerous_acls(g)
     sections["Cross-Domain Control Edges"] = find_foreign_edges(g)
     sections["GPO Control"] = find_gpo_control(g)
     sections["Privileged User Sessions"] = find_privileged_sessions(g)
@@ -2803,6 +2916,8 @@ def main():
         print(f"\n{C.BOLD}{C.CYAN}== Paths from Default Populations (Domain Users / Everyone) =={C.RESET}")
         if not pop_paths:
             print("   No traversable path from a default population to a high-value target. Good.")
+            print("   (edge types considered: group membership incl. nested, sessions, local admin/RDP/PSRemote/DCOM, "
+                  "delegation, dangerous ACLs incl. inherited container delegation, replication/LAPS/gMSA reads)")
         else:
             for i, p in enumerate(pop_paths, 1):
                 print(f"\n   {C.BOLD}Path #{i}{C.RESET} — {p['depth']} hop(s) to {C.RED}{p['target']}{C.RESET} "
@@ -2818,7 +2933,7 @@ def main():
     for title in ("DCSync Rights", "ADCS Abuse (ESC1-11, 13, 15, 16)",
                   "Delegation Abuse", "Domain Password & Lockout Policy",
                   "AS-REP Roastable Accounts", "Kerberoastable Accounts",
-                  "Dangerous ACLs (non-inherited, noise-filtered)",
+                  "Dangerous ACLs (noise-filtered, incl. container delegation)",
                   "Cross-Domain Control Edges", "GPO Control",
                   "Privileged User Sessions", "NTLM Relay Surface",
                   "Weak Crypto & UAC Flags", "Hybrid / Entra ID",
