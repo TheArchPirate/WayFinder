@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/wayfinder-banner.png" alt="Wayfinder — find the path, own the path"></p>
+
 # Wayfinder
 
 **Wayfinder** is a fully offline, zero-dependency analyzer for BloodHound collection data. It reads SharpHound v5/v6 and AzureHound exports and charts a course through an organization's identity attack surface — roasting targets, delegation abuse, DCSync rights, ADCS escalation paths, dangerous ACLs, hybrid/Entra ID seams, and shortest attack paths to high-value targets — without a single packet leaving your machine.
