@@ -41,7 +41,7 @@ import zipfile
 from collections import defaultdict, deque
 from pathlib import Path
 
-VERSION = "1.13.0"
+VERSION = "1.14.0"
 TOOL_NAME = "Wayfinder"
 
 # --------------------------------------------------------------------------
@@ -58,7 +58,8 @@ NOISE_SIDS = {
     "S-1-5-10",        # SELF (validated-write self ACEs)
     "S-1-3-0",         # CREATOR OWNER
 }
-NOISE_RID_SUFFIXES = ("-512", "-519", "-518", "-500", "-516", "-498")
+NOISE_RID_SUFFIXES = ("-512", "-519", "-518", "-500", "-516", "-498",
+                      "-526", "-527")  # Key Admins / Enterprise Key Admins hold key-credential rights by design
 # DA / EA / Schema Admins / built-in Administrator / Domain Controllers / Enterprise RODCs
 # (the last three hold replication rights by design; the rest are tier-0 by definition)
 
@@ -328,6 +329,7 @@ class Graph:
     def __init__(self):
         self.nodes = {}          # sid -> dict(name, kind, domain, props, doc_kinds)
         self.edges = []          # (src_sid, dst_sid, kind, inherited)
+        self.warnings = []       # schema/format anomalies noticed during analysis
         self.name_to_sid = {}    # UPPER name -> sid
         self.sam_to_sid = {}     # UPPER samaccountname -> sid
         self.dns_to_sid = {}     # UPPER dns host -> sid
@@ -397,7 +399,8 @@ class Graph:
         if adj is None:
             adj = defaultdict(list)
             for src, dst, kind, inh in self.edges:
-                if kind in TRAVERSABLE and (not inh or kind in DANGEROUS_RIGHTS):
+                if kind in TRAVERSABLE and (not inh or kind in DANGEROUS_RIGHTS
+                                            or kind in LAPS_RIGHTS or kind in GMSA_RIGHTS):
                     adj[src].append((dst, kind))
             self._trav_adj = adj
         return adj
@@ -745,13 +748,32 @@ def find_kerberoastable(g):
             if p.get("admincount") and not p.get("sensitive"):
                 detail += "; privileged and delegatable"
             raw_enc = p.get("supportedencryptiontypes")
-            try:
-                enc = int(raw_enc) if raw_enc is not None else None
-            except (TypeError, ValueError):
-                enc = 0
+            enc = None
+            if raw_enc is not None:
+                try:
+                    enc = int(raw_enc)
+                except (TypeError, ValueError):
+                    # unexpected format — try the list-of-algorithm-names form,
+                    # otherwise warn and make no inference (never guess)
+                    if isinstance(raw_enc, (list, tuple)) and raw_enc:
+                        names = {str(x).upper() for x in raw_enc}
+                        v = 0
+                        if any("AES256" in x for x in names):
+                            v |= 0x10
+                        if any("AES128" in x for x in names):
+                            v |= 0x08
+                        if any(x.startswith("RC4") for x in names):
+                            v |= 0x04
+                        if any(x.startswith("DES") for x in names):
+                            v |= 0x03
+                        enc = v or None
+                    if enc is None:
+                        g.warnings.append(
+                            f"{n['name']}: supportedencryptiontypes has unexpected format "
+                            f"({str(raw_enc)[:40]!r}) — encryption strength not assessed")
             # enc == 0 (collected but unset): the KDC defaults to RC4 for the
             # session key — as crack-fast as RC4-only. enc is None: the value
-            # was not collected — no inference either way.
+            # was not collected or not parseable — no inference either way.
             rc4_fast = enc is not None and (enc == 0 or not (enc & 0x18))
             if rc4_fast:
                 if enc and enc & 0x3:
@@ -864,6 +886,29 @@ def find_dcsync(g):
     return out
 
 
+def _common_dn_note(g, dsts):
+    """Best-effort attribution of an inherited grant's source container:
+    longest common suffix of the affected objects' parent DNs."""
+    parents = []
+    for d in dsts:
+        dn = _as_str(g.nodes.get(d, {}).get("props", {}).get("distinguishedname"))
+        if "," in dn:
+            parents.append(dn.split(",", 1)[1])
+    if not parents:
+        return ""
+    parts = [p.split(",") for p in parents]
+    suffix = []
+    for comps in zip(*[list(reversed(p)) for p in parts]):
+        if all(c.upper() == comps[0].upper() for c in comps):
+            suffix.append(comps[0])
+        else:
+            break
+    common = ",".join(reversed(suffix))
+    if common and ("OU=" in common.upper() or "CN=" in common.upper()):
+        return f" — likely granted at {common}"
+    return ""
+
+
 def find_dangerous_acls(g):
     out = []
     hv_suffixes = tuple(TIER0_RIDS) + ("-544",)
@@ -902,28 +947,80 @@ def find_dangerous_acls(g):
         sample = ", ".join(names[:8]) + (f" … +{len(names) - 8} more" if len(names) > 8 else "")
         out.append({"sev": sev,
                     "name": f"{g.name(src)} --{kind}--> {len(dsts)} object(s) via container delegation",
-                    "detail": f"{g.name(src)} holds {kind} over {len(dsts)} object(s), inherited from an OU/container grant (delegation misconfig): {sample}",
+                    "detail": f"{g.name(src)} holds {kind} over {len(dsts)} object(s), inherited from an OU/container grant{_common_dn_note(g, dsts)}: {sample}",
                     "src": src, "right": kind})
     return out
 
 
+def find_effective_tier0(g):
+    """Every principal holding tier-0-equivalent control, via any route:
+    group membership (direct/nested), replication rights, or control of a
+    tier-0 object (incl. ADCS infrastructure)."""
+    routes = defaultdict(set)   # sid -> {route descriptions}
+    for m in g.tier0_member_sids():
+        if not g.is_noise_principal(m):
+            routes[m].add("tier-0 group membership (direct or nested)")
+    sync_rights = defaultdict(set)
+    for src, dst, kind, inh in g.edges:
+        if not inh and kind in DCSYNC_RIGHTS \
+                and g.nodes.get(dst, {}).get("kind") == "DOMAIN":
+            sync_rights[src].add(kind)
+    for src, kinds in sync_rights.items():
+        if {"GetChanges", "GetChangesAll"} <= kinds and not g.is_noise_principal(src):
+            routes[src].add("holds DCSync replication rights")
+    hv_suffixes = tuple(TIER0_RIDS) + ("-544",)
+    for src, dst, kind, inh in g.edges:
+        if kind not in DANGEROUS_RIGHTS or g.is_noise_principal(src):
+            continue
+        tgt = g.nodes.get(dst, {})
+        tk = tgt.get("kind", "")
+        if (tgt.get("props", {}).get("highvalue") or tk == "DOMAIN"
+                or dst.endswith(hv_suffixes)
+                or tk in ("ENTERPRISECA", "ROOTCA", "NTAUTHSTORE", "CERTTEMPLATE")):
+            routes[src].add(f"{kind} over {g.name(dst)}"
+                            f"{' (inherited)' if inh else ''}")
+    out = []
+    for sid in sorted(routes, key=lambda s: g.name(s)):
+        r = sorted(routes[sid])
+        out.append({"sev": "INFO",
+                    "name": f"{g.name(sid)} ({len(r)} route(s))",
+                    "detail": "; ".join(r[:6]) + (f" … +{len(r) - 6} more" if len(r) > 6 else "")})
+    return out
+
+
 def find_tier0_groups(g):
-    """Privileged group membership, including nested resolution."""
+    """Privileged group membership — direct and nested (transitive, with chain)."""
     out = []
     tier0 = []  # (sid, display name)
     for sid, n in g.nodes.items():
         if n["kind"] != "GROUP":
+            continue
+        if sid == "S-1-5-32-544" or sid.endswith("-S-1-5-32-544"):
+            tier0.append((sid, "Administrators"))
             continue
         for suffix, gname in TIER0_RIDS.items():
             if sid.endswith(suffix):
                 tier0.append((sid, gname))
                 break
     for sid, gname in tier0:
-        members = g.groups_members.get(sid, [])
-        for m in members:
+        # BFS over members, recording the group each member was reached through
+        parent = {}   # member sid -> group sid that directly contains it
+        seen = {sid}
+        dq = deque([sid])
+        while dq:
+            grp = dq.popleft()
+            for m in g.groups_members.get(grp, []):
+                if m in seen:
+                    continue
+                seen.add(m)
+                parent[m] = grp
+                if g.nodes.get(m, {}).get("kind") == "GROUP" or m in g.groups_members:
+                    dq.append(m)
+        for m, via_grp in sorted(parent.items(), key=lambda kv: g.name(kv[0])):
             mn = g.nodes.get(m, {})
             mname = mn.get("name", m)
             mkind = mn.get("kind", "?")
+            via = "" if via_grp == sid else f" via {g.name(via_grp)}"
             sev = "INFO"
             upper = mname.upper()
             if upper in ("EVERYONE", "AUTHENTICATED USERS") or \
@@ -935,15 +1032,7 @@ def find_tier0_groups(g):
                 sev = "INFO"
             out.append({"sev": sev,
                         "name": f"{mname} -> {gname}",
-                        "detail": f"{mkind} member of {gname}"})
-    # Builtin Administrators (S-1-5-32-544)
-    for sid, n in g.nodes.items():
-        if n["kind"] == "GROUP" and sid == "S-1-5-32-544":
-            for m in g.groups_members.get(sid, []):
-                mn = g.nodes.get(m, {})
-                out.append({"sev": "INFO",
-                            "name": f"{mn.get('name', m)} -> Administrators",
-                            "detail": "member of BUILTIN Administrators"})
+                        "detail": f"{mkind} member of {gname}{via}"})
     return out
 
 
@@ -1008,14 +1097,21 @@ def find_laps(g):
     if unknown:
         out.append({"sev": "INFO", "name": f"LAPS state unknown for {unknown} host(s)",
                     "detail": "haslaps was not collected for these computers — excluded from the coverage figure"})
+    laps_inh = defaultdict(list)   # (src, kind) -> [dst] — OU-delegated read rights
     for src, dst, kind, inh in g.edges:
-        if inh or g.is_noise_principal(src):
+        if g.is_noise_principal(src):
             continue
         # DCs implicitly read everything — a DC holding a read edge is expected
         srcn = g.nodes.get(src, {})
         sp = srcn.get("props", {})
         if srcn.get("kind") == "COMPUTER" and (
                 sp.get("isdc") or "OU=DOMAIN CONTROLLERS" in _as_str(sp.get("distinguishedname")).upper()):
+            continue
+        if inh:
+            # LAPS read access is almost always delegated at OU level —
+            # aggregate like container delegation
+            if kind in LAPS_RIGHTS or kind in GMSA_RIGHTS:
+                laps_inh[(src, kind)].append(dst)
             continue
         if kind in LAPS_RIGHTS:
             out.append({"sev": "HIGH",
@@ -1025,6 +1121,14 @@ def find_laps(g):
             out.append({"sev": "HIGH",
                         "name": f"{g.name(src)} --{kind}--> {g.name(dst)}",
                         "detail": f"{g.name(src)} can read the gMSA password of {g.name(dst)}"})
+    for (src, kind), dsts in sorted(laps_inh.items()):
+        what = "LAPS password" if kind in LAPS_RIGHTS else "gMSA password"
+        names = sorted(g.name(d) for d in dsts)
+        sample = ", ".join(names[:8]) + (f" … +{len(names) - 8} more" if len(names) > 8 else "")
+        out.append({"sev": "HIGH",
+                    "name": f"{g.name(src)} --{kind}--> {len(dsts)} object(s) via container delegation",
+                    "detail": f"{g.name(src)} can read the {what} of {len(dsts)} object(s), inherited from an OU/container grant{_common_dn_note(g, dsts)}: {sample}",
+                    "src": src, "right": kind})
     return out
 
 
@@ -1147,8 +1251,17 @@ def find_trusts(g):
         dv = t["direction"]
         if not isinstance(dv, int) or isinstance(dv, bool):
             # some collectors emit names ("Bidirectional") or numeric strings
+            s = str(dv).strip().lower()
             dv = {"disabled": 0, "inbound": 1, "outbound": 2,
-                  "bidirectional": 3}.get(str(dv).strip().lower())
+                  "bidirectional": 3}.get(s)
+            if dv is None:
+                try:
+                    dv = int(s)
+                except (TypeError, ValueError):
+                    dv = None
+                    g.warnings.append(
+                        f"trust {t['domain']} -> {t['target']}: unrecognised "
+                        f"TrustDirection format ({t['direction']!r}) — not assessed")
         direction = {0: "Disabled", 1: "Inbound", 2: "Outbound", 3: "Bidirectional"}.get(dv, str(t["direction"]))
         sev = "INFO"
         detail = f"{t['domain']} -> {t['target']}: {direction}, {t['type']}, transitive={t['transitive']}"
@@ -1956,6 +2069,7 @@ body{background-color:#0b0e14;
 .hdr h1{color:#f0f4fa;font-size:26px;letter-spacing:.4px;margin:0}
 .hdr h1 .dim{color:#5f7089;font-weight:600}
 .sub{color:#7d8ba1;margin-top:6px;font-size:13px}
+.warnmiss{color:#e8b339}
 .pills{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}
 .pill{background:#151d2b;border:1px solid #26303f;border-radius:999px;padding:4px 14px;
       font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:#8b9bb5}
@@ -2500,9 +2614,17 @@ def _abuse_html(f):
             f"<div class='abwrap'>{''.join(rows)}</div></details>")
 
 
-def render_html(stats, sections, paths, wins, inventory=None):
+def render_html(stats, sections, paths, wins, inventory=None, coverage=None):
     """Build the full (non-truncated) self-contained HTML report."""
     gen = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    cov_html = ""
+    if coverage:
+        have = sum(1 for v in coverage.values() if v)
+        missing = [k for k, v in coverage.items() if not v]
+        cov_html = (f"<div class='sub'>{_esc(f'Coverage: {have}/{len(coverage)} data types collected')}"
+                    + (f" — <span class='warnmiss'>not collected: {_esc(', '.join(missing))} "
+                       "(related checks cannot be assessed)</span>" if missing else "")
+                    + "</div>")
     sev_counts = {s: 0 for s in ("CRIT", "HIGH", "MED", "INFO")}
     for findings in sections.values():
         for f in findings:
@@ -2521,6 +2643,7 @@ def render_html(stats, sections, paths, wins, inventory=None):
          f"<h1>{_esc(TOOL_NAME)} <span class='dim'>report</span></h1>",
          f"<div class='sub'>Generated {_esc(gen)} &middot; {_esc(TOOL_NAME)} v{_esc(VERSION)} &middot; "
          "fully offline &mdash; this file loads no external resources</div>",
+         cov_html,
          f"<div class='pills'>{pills_html}</div>",
          "</div>",
          "<div class='tiles'>",
@@ -2781,6 +2904,14 @@ def main():
     ap.add_argument("--no-color", action="store_true")
     ap.add_argument("--include-inherited", action="store_true",
                     help="Include inherited ACEs in analysis (noisy)")
+    ap.add_argument("--no-abuse", action="store_true",
+                    help="Omit per-finding abuse guidance (Windows/Linux/OPSEC) "
+                         "from all output — for reports shared outside the team")
+    ap.add_argument("--csv", type=Path,
+                    help="Write flat CSV export (section, severity, name, detail)")
+    ap.add_argument("--fail-on", choices=["CRIT", "HIGH", "MED", "INFO"],
+                    help="Exit with code 2 if any finding at this severity or "
+                         "higher exists (for CI/scheduled runs)")
     args = ap.parse_args()
 
     global USE_COLOR
@@ -2832,6 +2963,29 @@ def main():
         n_az = sum(len(doc_objects(d)) for _, d in az_docs)
         print(f"  Entra ID: {n_az} object(s) across {len(az_docs)} file(s) — hybrid analysis enabled")
 
+    # Collection coverage: which data types the collector actually gathered.
+    # An empty findings section means "nothing found in the data" — coverage
+    # tells you whether the data existed to find anything in.
+    coverage = {
+        "sessions": bool(g.computer_sessions),
+        "local admins": any(k == "AdminTo" for _, _, k, _ in g.edges),
+        "ADCS objects": bool(g.ca_data) or any(
+            n["kind"] in ADCS_KINDS.values() for n in g.nodes.values()),
+        "CA registry": any(c.get("registry") for c in g.ca_data.values()),
+        "DC registry": any(n["props"].get("_dcregistry") for n in g.nodes.values()),
+        "LAPS attributes": any(n["kind"] == "COMPUTER" and "haslaps" in n["props"]
+                               for n in g.nodes.values()),
+        "trusts": bool(g.trusts),
+        "GPOs": any(n["kind"] == "GPO" for n in g.nodes.values()),
+        "OUs/containers": any(n["kind"] in ("OU", "CONTAINER") for n in g.nodes.values()),
+        "AzureHound": bool(az_docs),
+    }
+    _have = [k for k, v in coverage.items() if v]
+    _missing = [k for k, v in coverage.items() if not v]
+    print(f"  Coverage ({len(_have)}/{len(coverage)} data types): {', '.join(_have) or 'none'}")
+    if _missing:
+        print(f"  NOT collected (related checks cannot be assessed): {', '.join(_missing)}")
+
     sections = {}
     sections["Domains & Trusts"] = find_trusts(g)
     sections["Domain Password & Lockout Policy"] = find_domain_policy(g)
@@ -2841,6 +2995,7 @@ def main():
     sections["DCSync Rights"] = find_dcsync(g)
     sections["ADCS Abuse (ESC1-11, 13, 15, 16)"] = find_adcs(g)
     sections["Tier-0 Group Membership"] = find_tier0_groups(g)
+    sections["Effective Tier-0 Inventory"] = find_effective_tier0(g)
     sections["Moderately-Privileged Groups"] = find_moderate_groups(g)
     sections["Stealth & Hidden Memberships"] = find_stealth(g)
     sections["Anomalies (orphan SIDs, new tier-0 objects)"] = find_anomalies(g)
@@ -2862,11 +3017,20 @@ def main():
         sections["Azure RBAC & Graph Permissions"] = find_azure_rbac(g, az_docs)
 
     # attach BloodHound-style abuse guidance (flows into JSON + HTML output)
-    for title, findings in sections.items():
-        for f in findings:
-            ab = abuse_for(title, f)
-            if ab:
-                f["abuse"] = ab
+    if not args.no_abuse:
+        for title, findings in sections.items():
+            for f in findings:
+                ab = abuse_for(title, f)
+                if ab:
+                    f["abuse"] = ab
+
+    # schema/format anomalies noticed during analysis — surfaced, never guessed
+    if g.warnings:
+        sections["Schema Warnings"] = [{"sev": "INFO", "name": w,
+                                        "detail": "Unexpected data format — the related property was not assessed"}
+                                       for w in sorted(set(g.warnings))]
+        for w in sorted(set(g.warnings)):
+            print(f"[!] schema warning: {w}", file=sys.stderr)
 
     for title, findings in sections.items():
         sorted_f = print_section(title, findings, limit)
@@ -2952,6 +3116,22 @@ def main():
     if len(wins) > 20:
         print(f"   ... {len(wins) - 20} more")
 
+    # ---- optional CSV export (flat, for ticketing) ----
+    if args.csv:
+        import csv
+        try:
+            with args.csv.open("w", newline="", encoding="utf-8") as fh:
+                w = csv.writer(fh)
+                w.writerow(["section", "severity", "name", "detail"])
+                for title, findings in sections.items():
+                    for f in findings:
+                        w.writerow([title, f["sev"], f["name"],
+                                    _as_str(f.get("detail")).replace("\n", " ")])
+        except OSError as e:
+            print(f"[!] could not write CSV report: {e}", file=sys.stderr)
+        else:
+            print(f"\n[+] CSV findings written to {args.csv}")
+
     # ---- optional JSON dump ----
     if args.json:
         def clean(findings):
@@ -2960,6 +3140,7 @@ def main():
             "version": VERSION,
             "stats": {"users": n_users, "groups": n_groups, "computers": n_comps,
                       "domains": n_domains, "edges": len(g.edges)},
+            "coverage": coverage,
             "trusts": g.trusts,
             "sections": {t: clean(f) for t, f in sections.items()},
             "paths": [{"depth": p["depth"], "target": p["target"],
@@ -2981,11 +3162,19 @@ def main():
         stats = {"users": n_users, "groups": n_groups, "computers": n_comps,
                  "domains": n_domains, "edges": len(g.edges), "azure": n_az}
         try:
-            args.html.write_text(render_html(stats, sections, paths, wins, build_inventory(g)))
+            args.html.write_text(render_html(stats, sections, paths, wins,
+                                             build_inventory(g), coverage=coverage))
         except OSError as e:
             print(f"[!] could not write HTML report: {e}", file=sys.stderr)
         else:
             print(f"\n[+] HTML report written to {args.html}")
+
+    # ---- CI/scheduled-run exit code ----
+    if args.fail_on:
+        threshold = SEV_ORDER[args.fail_on]
+        if any(SEV_ORDER.get(f["sev"], 9) <= threshold
+               for findings in sections.values() for f in findings):
+            sys.exit(2)
 
 
 if __name__ == "__main__":

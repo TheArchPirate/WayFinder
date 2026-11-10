@@ -106,12 +106,15 @@ python3 wayfinder.py --data bh.zip --user JSMITH@CORP.LOCAL --html report.html
 | `--json <file>` | Write full findings as JSON |
 | `--html <file>` | Write a full (non-truncated) HTML report with attack paths rendered as BloodHound-style SVG chain diagrams, clickable severity summary tiles, a live search bar (object name, SID, edge kind, section), severity filter chips (CRIT/HIGH/MED/INFO), per-finding abuse guidance (Windows/Linux/OPSEC), and a domain-inventory sidebar (users/groups/computers/PKI, high-value split from standard) |
 | `--no-color` | Disable ANSI colors (for piping/files) |
+| `--no-abuse` | Omit per-finding abuse guidance (Windows/Linux/OPSEC) from all output — for reports shared outside the team |
+| `--csv <file>` | Write a flat CSV export (section, severity, name, detail) for ticketing |
+| `--fail-on <SEV>` | Exit with code 2 if any finding at this severity or higher exists (CRIT/HIGH/MED/INFO) — for CI/scheduled runs |
 | `--include-inherited` | Include ALL inherited ACEs (noisy — off by default; inherited ACEs carrying dangerous rights are always analyzed) |
 
 ### Example output
 
 ```
-[Wayfinder v1.13.0] loaded 7 collection file(s)
+[Wayfinder v1.14.0] loaded 7 collection file(s)
   Objects: 6 users, 2 groups, 4 computers, 1 domains | Edges: 17
   Entra ID: 2 object(s) across 2 file(s) — hybrid analysis enabled
 
