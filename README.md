@@ -50,6 +50,7 @@ BloodHound collections are some of the most sensitive artifacts on an engagement
 **Precision-first (no false positives by design)**
 - Only explicitly collected values are flagged — an absent key never implies a misconfiguration
 - Severity ratings calibrated against industry references (PingCastle health-check scoring, SpecterOps Certified Pre-Owned): CRIT = direct path to domain/tenant compromise, HIGH = one condition away, MED = enabler/situational, INFO = expected/hygiene
+- BloodHound-style abuse guidance on actionable findings (Windows abuse / Linux abuse / OPSEC), in both JSON and HTML output — attached only where the technique is unambiguous, never guessed
 - Deny ACEs never produce control edges; deny ACEs and inherited noise are excluded at ingest
 - Only well-known, vendor-published GUIDs/SIDs/RIDs are matched by identity; unknown custom roles are ignored, never guessed
 - Composite attack chains require *all* conditions present; partial matches are reported at lower severity with "verify" notes
@@ -103,14 +104,14 @@ python3 wayfinder.py --data bh.zip --user JSMITH@CORP.LOCAL --html report.html
 | `--limit N` | Max findings printed per section (default 15) |
 | `--full` | No truncation |
 | `--json <file>` | Write full findings as JSON |
-| `--html <file>` | Write a full (non-truncated) HTML report with attack paths rendered as BloodHound-style SVG chain diagrams, clickable severity summary tiles, a live search bar (object name, SID, edge kind, section), severity filter chips (CRIT/HIGH/MED/INFO), and a domain-inventory sidebar (users/groups/computers/PKI, high-value split from standard) |
+| `--html <file>` | Write a full (non-truncated) HTML report with attack paths rendered as BloodHound-style SVG chain diagrams, clickable severity summary tiles, a live search bar (object name, SID, edge kind, section), severity filter chips (CRIT/HIGH/MED/INFO), per-finding abuse guidance (Windows/Linux/OPSEC), and a domain-inventory sidebar (users/groups/computers/PKI, high-value split from standard) |
 | `--no-color` | Disable ANSI colors (for piping/files) |
 | `--include-inherited` | Include inherited ACEs (noisy — off by default) |
 
 ### Example output
 
 ```
-[Wayfinder v1.11.0] loaded 7 collection file(s)
+[Wayfinder v1.12.0] loaded 7 collection file(s)
   Objects: 6 users, 2 groups, 4 computers, 1 domains | Edges: 17
   Entra ID: 2 object(s) across 2 file(s) — hybrid analysis enabled
 

